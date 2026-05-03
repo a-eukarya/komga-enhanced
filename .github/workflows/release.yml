@@ -127,6 +127,27 @@ jobs:
           cp "komga/build/libs/${JAR_NAME}" docker-build/assembly/
           sed "s/{{distributionArtifactFile}}/${JAR_NAME}/g" komga/docker/Dockerfile.tpl > docker-build/Dockerfile
 
+      - name: Compute Docker tags
+        id: docker_tags
+        run: |
+          VER="${{ steps.versions.outputs.version_next }}"
+          if [ "${{ inputs.docker_private }}" = "true" ]; then
+            TAGS="08shiro80/komga-private:latest
+          08shiro80/komga-private:${VER}"
+          else
+            # Public release: tag BOTH the public image and the private test image
+            # from the same build (so the test branch never lags behind the public one)
+            TAGS="08shiro80/komga:latest
+          08shiro80/komga:${VER}
+          08shiro80/komga-private:latest
+          08shiro80/komga-private:${VER}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
       - name: Build and push Docker images
         uses: docker/build-push-action@v7
         with:
@@ -135,6 +156,4 @@ jobs:
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          tags: |
-            ${{ inputs.docker_private && '08shiro80/komga-private' || '08shiro80/komga' }}:latest
-            ${{ inputs.docker_private && '08shiro80/komga-private' || '08shiro80/komga' }}:${{ steps.versions.outputs.version_next }}
+          tags: ${{ steps.docker_tags.outputs.tags }}

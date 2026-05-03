@@ -146,6 +146,50 @@ class PluginController(
     return provider.search(query)
   }
 
+  @GetMapping("mangadex-metadata/tags")
+  @Operation(summary = "List all MangaDex tags (cached)", tags = [TagNames.PLUGINS])
+  fun listMangaDexTags(): List<org.gotson.komga.infrastructure.metadata.mangadex.MangaDexTag> {
+    if (pluginRepository.findByIdOrNull("mangadex-metadata")?.enabled != true) {
+      throw ResponseStatusException(HttpStatus.BAD_REQUEST, "MangaDex Metadata plugin is not enabled")
+    }
+    return mangaDexMetadataPlugin.getTags()
+  }
+
+  @PostMapping("mangadex-metadata/downloadable-check", consumes = [MediaType.APPLICATION_JSON_VALUE])
+  @Operation(summary = "Per-manga check whether MangaDex has at least one downloadable chapter in the given language", tags = [TagNames.PLUGINS])
+  fun mangaDexDownloadableCheck(
+    @RequestBody req: MangaDexDownloadableCheckRequest,
+  ): Map<String, Boolean> {
+    if (pluginRepository.findByIdOrNull("mangadex-metadata")?.enabled != true) {
+      throw ResponseStatusException(HttpStatus.BAD_REQUEST, "MangaDex Metadata plugin is not enabled")
+    }
+    val lang = req.language?.takeIf { it.isNotBlank() } ?: "en"
+    return (req.ids ?: emptyList()).associateWith { id ->
+      mangaDexMetadataPlugin.hasDownloadableChapters(id, lang)
+    }
+  }
+
+  @PostMapping("mangadex-metadata/search-advanced", consumes = [MediaType.APPLICATION_JSON_VALUE])
+  @Operation(summary = "Advanced MangaDex search with tag/status/rating/demographic filters", tags = [TagNames.PLUGINS])
+  fun searchMangaDexAdvanced(
+    @RequestBody req: MangaDexAdvancedSearchRequest,
+  ): org.gotson.komga.infrastructure.metadata.mangadex.MangaDexSearchPage {
+    if (pluginRepository.findByIdOrNull("mangadex-metadata")?.enabled != true) {
+      throw ResponseStatusException(HttpStatus.BAD_REQUEST, "MangaDex Metadata plugin is not enabled")
+    }
+    return mangaDexMetadataPlugin.searchAdvanced(
+      query = req.query?.takeIf { it.isNotBlank() },
+      includedTagIds = req.includedTagIds ?: emptyList(),
+      excludedTagIds = req.excludedTagIds ?: emptyList(),
+      status = req.status ?: emptyList(),
+      contentRating = req.contentRating ?: emptyList(),
+      publicationDemographic = req.publicationDemographic ?: emptyList(),
+      hasAvailableChapters = req.hasAvailableChapters,
+      offset = req.offset ?: 0,
+      limit = req.limit ?: 24,
+    )
+  }
+
   @GetMapping("{id}/metadata/{externalId}")
   @Operation(summary = "Get detailed metadata from plugin", tags = [TagNames.PLUGINS])
   fun getMetadata(
@@ -308,14 +352,31 @@ class PluginController(
     request.status?.let {
       metadata["status"] =
         when (it.lowercase()) {
-          "ongoing" -> "Continuing"
-          "completed" -> "Ended"
-          "hiatus" -> "Hiatus"
-          "cancelled" -> "Cancelled"
+          "ongoing", "continuing" -> "Continuing"
+          "completed", "ended", "finished" -> "Ended"
+          "hiatus", "paused" -> "Hiatus"
+          "cancelled", "canceled", "dropped" -> "Cancelled"
+          "releasing", "current" -> "Continuing"
+          "not_yet_released" -> "Continuing"
           else -> it
         }
     }
     request.externalId?.let { metadata["comicid"] = it }
+    val providerWebUrl: String? =
+      run {
+        val ext = request.externalId?.takeIf { it.isNotBlank() } ?: return@run null
+        val explicit = request.provider?.lowercase()
+        when {
+          explicit == "anilist" -> "https://anilist.co/manga/$ext"
+          explicit == "mangadex" -> "https://mangadex.org/title/$ext"
+          explicit == "kitsu" -> "https://kitsu.app/manga/$ext"
+          Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", RegexOption.IGNORE_CASE).matches(ext) ->
+            "https://mangadex.org/title/$ext"
+          ext.all { it.isDigit() } -> "https://anilist.co/manga/$ext"
+          else -> null
+        }
+      }
+    providerWebUrl?.let { metadata["web_url"] = it }
     if (request.genres?.isNotEmpty() == true) metadata["genres"] = request.genres
     if (request.tags?.isNotEmpty() == true) metadata["tags"] = request.tags
     if (alternateTitles.isNotEmpty()) metadata["alternate_titles"] = alternateTitles
@@ -426,6 +487,23 @@ class PluginController(
   }
 }
 
+data class MangaDexDownloadableCheckRequest(
+  val language: String? = null,
+  val ids: List<String>? = null,
+)
+
+data class MangaDexAdvancedSearchRequest(
+  val query: String? = null,
+  val includedTagIds: List<String>? = null,
+  val excludedTagIds: List<String>? = null,
+  val status: List<String>? = null,
+  val contentRating: List<String>? = null,
+  val publicationDemographic: List<String>? = null,
+  val hasAvailableChapters: Boolean? = null,
+  val offset: Int? = null,
+  val limit: Int? = null,
+)
+
 data class PluginApplyAuthor(
   val name: String,
   val role: String,
@@ -447,6 +525,7 @@ data class PluginApplyMetadataRequest(
   val tags: List<String>? = null,
   val authors: List<PluginApplyAuthor>? = null,
   val alternativeTitles: Map<String, String>? = null,
+  val provider: String? = null,
 )
 
 fun Plugin.toDto() =

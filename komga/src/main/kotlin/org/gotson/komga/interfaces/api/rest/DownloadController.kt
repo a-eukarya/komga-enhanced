@@ -36,9 +36,14 @@ import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.PutMapping
 import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
 import org.springframework.web.server.ResponseStatusException
+import java.time.Instant
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 
 private val logger = KotlinLogging.logger {}
 
@@ -283,9 +288,10 @@ class DownloadController(
   }
 
   @PostMapping("repair-comicinfo/{libraryId}")
-  @Operation(summary = "Repair missing ComicInfo.xml and zip comments in MangaDex CBZ files", tags = [TagNames.DOWNLOADS])
+  @Operation(summary = "Repair missing ComicInfo.xml and zip comments in MangaDex CBZ files (async)", tags = [TagNames.DOWNLOADS])
   fun repairComicInfo(
     @PathVariable libraryId: String,
+    @RequestParam(defaultValue = "false") force: Boolean,
   ): ResponseEntity<Map<String, Any>> {
     val library =
       libraryRepository.findByIdOrNull(libraryId)
@@ -294,6 +300,10 @@ class DownloadController(
     val libraryDir = library.path.toFile()
     if (!libraryDir.isDirectory) {
       throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Library path is not a directory")
+    }
+
+    if (repairProgress.get().running) {
+      throw ResponseStatusException(HttpStatus.CONFLICT, "Re-inject ComicInfo already running for library ${repairProgress.get().libraryId}")
     }
 
     val uuidRegex = Regex("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
@@ -320,26 +330,76 @@ class DownloadController(
       }
     }
 
-    var totalRepaired = 0
-    var totalSkipped = 0
-    val errors = mutableListOf<String>()
+    val totalMangas = mangaDexDirs.size
+    repairProgress.set(
+      RepairProgress(
+        running = true,
+        libraryId = libraryId,
+        total = totalMangas,
+        processed = 0,
+        repaired = 0,
+        skipped = 0,
+        errors = emptyList(),
+        startedAt = Instant.now(),
+        finishedAt = null,
+      ),
+    )
 
-    for ((mangaDexId, dirs) in mangaDexDirs) {
-      val result = galleryDlWrapper.repairMissingComicInfo(mangaDexId, dirs)
-      totalRepaired += result.repaired
-      totalSkipped += result.skipped
-      if (result.error != null) errors.add("$mangaDexId: ${result.error}")
+    repairExecutor.submit {
+      var repaired = 0
+      var skipped = 0
+      val errors = mutableListOf<String>()
+      var processed = 0
+      try {
+        for ((mangaDexId, dirs) in mangaDexDirs) {
+          val result = galleryDlWrapper.repairMissingComicInfo(mangaDexId, dirs, forceReinject = force)
+          repaired += result.repaired
+          skipped += result.skipped
+          if (result.error != null) errors.add("$mangaDexId: ${result.error}")
+          processed++
+          repairProgress.updateAndGet {
+            it.copy(processed = processed, repaired = repaired, skipped = skipped, errors = errors.toList())
+          }
+          // Belt-and-suspenders on top of MangaDexApiClient's own rate limiter —
+          // 250 ms between mangas keeps the global ~5 req/sec budget honest even
+          // when getMangaMetadata + getChaptersForManga both fire per manga.
+          try {
+            Thread.sleep(250)
+          } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return@submit
+          }
+        }
+      } catch (e: Exception) {
+        logger.error(e) { "Re-inject ComicInfo crashed unexpectedly" }
+        errors.add("Unexpected crash: ${e.message}")
+      } finally {
+        repairProgress.updateAndGet {
+          it.copy(
+            running = false,
+            processed = processed,
+            repaired = repaired,
+            skipped = skipped,
+            errors = errors.toList(),
+            finishedAt = Instant.now(),
+          )
+        }
+        logger.info { "Re-inject ComicInfo finished for library $libraryId: processed=$processed/$totalMangas repaired=$repaired skipped=$skipped errors=${errors.size}" }
+      }
     }
 
-    return ResponseEntity.ok(
+    return ResponseEntity.accepted().body(
       mapOf(
-        "repaired" to totalRepaired,
-        "skipped" to totalSkipped,
-        "mangaProcessed" to mangaDexDirs.size,
-        "errors" to errors,
+        "status" to "started",
+        "mangaProcessed" to 0,
+        "mangaTotal" to totalMangas,
       ),
     )
   }
+
+  @GetMapping("repair-comicinfo/status")
+  @Operation(summary = "Progress for the currently running or last finished re-inject job", tags = [TagNames.DOWNLOADS])
+  fun repairComicInfoStatus(): RepairProgress = repairProgress.get()
 
   @PostMapping("follow-txt/{libraryId}/sync-to-mangadex")
   @Operation(summary = "Upload follow.txt MangaDex URLs to MangaDex follows list", tags = [TagNames.DOWNLOADS])
@@ -393,6 +453,41 @@ class DownloadController(
     if (config != null && config.urls.isNotEmpty()) {
       downloadScheduler.processFollowConfigNow(config)
     }
+  }
+
+  companion object {
+    private val repairExecutor: ExecutorService =
+      Executors.newSingleThreadExecutor { r ->
+        Thread(r, "repair-comicinfo").apply { isDaemon = true }
+      }
+    private val repairProgress: AtomicReference<RepairProgress> = AtomicReference(RepairProgress.idle())
+  }
+}
+
+data class RepairProgress(
+  val running: Boolean,
+  val libraryId: String?,
+  val total: Int,
+  val processed: Int,
+  val repaired: Int,
+  val skipped: Int,
+  val errors: List<String>,
+  val startedAt: Instant?,
+  val finishedAt: Instant?,
+) {
+  companion object {
+    fun idle() =
+      RepairProgress(
+        running = false,
+        libraryId = null,
+        total = 0,
+        processed = 0,
+        repaired = 0,
+        skipped = 0,
+        errors = emptyList(),
+        startedAt = null,
+        finishedAt = null,
+      )
   }
 }
 

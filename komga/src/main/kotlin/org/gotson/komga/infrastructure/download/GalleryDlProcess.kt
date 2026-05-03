@@ -85,6 +85,7 @@ class GalleryDlProcess {
     val tempFile = File.createTempFile("gallery-dl-", ".json")
     val mangadexUsername = pluginConfig["mangadex_username"]
     val mangadexPassword = pluginConfig["mangadex_password"]
+    val chapterNaming = pluginConfig["chapter_naming"]?.takeIf { it.isNotBlank() }
     val websiteConfigs = getDefaultWebsiteConfigs(defaultLanguage).toMutableMap()
 
     if (!mangadexUsername.isNullOrBlank() || !mangadexPassword.isNullOrBlank()) {
@@ -92,6 +93,12 @@ class GalleryDlProcess {
       if (!mangadexUsername.isNullOrBlank()) mangadexConfig["username"] = mangadexUsername
       if (!mangadexPassword.isNullOrBlank()) mangadexConfig["password"] = mangadexPassword
       websiteConfigs["mangadex"] = mangadexConfig
+    }
+
+    if (chapterNaming != null) {
+      for ((site, cfg) in websiteConfigs.toList()) {
+        websiteConfigs[site] = cfg.toMutableMap().apply { put("directory", listOf(chapterNaming)) }
+      }
     }
 
     val config =
@@ -107,6 +114,11 @@ class GalleryDlProcess {
               "extension" to "cbz",
               "compression" to "store",
               "keep-files" to false,
+            ),
+            mapOf(
+              "name" to "komga",
+              "extension" to "cbz",
+              "series-json" to false,
             ),
           ),
       )

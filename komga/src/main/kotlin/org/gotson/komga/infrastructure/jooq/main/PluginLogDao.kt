@@ -13,6 +13,7 @@ import org.springframework.data.domain.Page
 import org.springframework.data.domain.PageImpl
 import org.springframework.data.domain.Pageable
 import org.springframework.stereotype.Component
+import java.time.LocalDateTime
 
 @Component
 class PluginLogDao(
@@ -97,6 +98,13 @@ class PluginLogDao(
     dslRW
       .deleteFrom(pl)
       .where(pl.PLUGIN_ID.eq(pluginId))
+      .execute()
+  }
+
+  override fun deleteOlderThan(dateTime: LocalDateTime) {
+    dslRW
+      .deleteFrom(pl)
+      .where(pl.CREATED_DATE.lt(dateTime))
       .execute()
   }
 

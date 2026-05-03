@@ -63,11 +63,46 @@ class MylarSeriesProvider(
           }
         }
 
-      val links =
-        if (metadata.comicid.isNotBlank()) {
-          listOf(WebLink("MangaDex", URI("https://mangadex.org/title/${metadata.comicid}")))
-        } else {
-          null
+      // Prefer an explicit web_url (provider-aware; written by PluginController / automatch)
+      // plus optional tracker_links (multi-source automatch). Fall back to legacy MangaDex UUID comicid.
+      val links: List<WebLink>? =
+        run {
+          fun labelForUrl(urlStr: String): String =
+            runCatching { URI(urlStr).host }.getOrNull()?.let { host ->
+              when {
+                host.contains("anilist.co") -> "AniList"
+                host.contains("mangadex.org") -> "MangaDex"
+                host.contains("kitsu") -> "Kitsu"
+                host.contains("myanimelist.net") -> "MyAnimeList"
+                host.contains("metron.cloud") -> "Metron"
+                else -> host
+              }
+            } ?: "Source"
+
+          val out = linkedMapOf<String, WebLink>()
+
+          fun addUrl(
+            urlStr: String,
+            preferredLabel: String?,
+          ) {
+            val u = urlStr.trim().ifBlank { return }
+            if (!out.containsKey(u)) {
+              val label = preferredLabel?.takeIf { it.isNotBlank() } ?: labelForUrl(u)
+              out[u] = WebLink(label, URI(u))
+            }
+          }
+
+          metadata.webUrl?.let { addUrl(it, null) }
+          metadata.trackerLinks?.forEach { addUrl(it.url, it.label) }
+
+          when {
+            out.isNotEmpty() -> out.values.toList()
+            metadata.comicid.isNotBlank() &&
+              Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", RegexOption.IGNORE_CASE)
+                .matches(metadata.comicid) ->
+              listOf(WebLink("MangaDex", URI("https://mangadex.org/title/${metadata.comicid}")))
+            else -> null
+          }
         }
 
       return SeriesMetadataPatch(

@@ -6,6 +6,7 @@ import org.gotson.komga.jooq.main.Tables
 import org.jooq.DSLContext
 import org.springframework.stereotype.Component
 import org.springframework.transaction.annotation.Transactional
+import java.time.LocalDateTime
 
 @Component
 class HistoricalEventDao(
@@ -37,5 +38,17 @@ class HistoricalEventDao(
           }
         }.execute()
     }
+  }
+
+  @Transactional
+  override fun deleteOlderThan(dateTime: LocalDateTime) {
+    dslRW
+      .deleteFrom(ep)
+      .where(ep.ID.`in`(dslRW.select(e.ID).from(e).where(e.TIMESTAMP.lt(dateTime))))
+      .execute()
+    dslRW
+      .deleteFrom(e)
+      .where(e.TIMESTAMP.lt(dateTime))
+      .execute()
   }
 }

@@ -462,8 +462,6 @@ class GalleryDlWrapper(
           org.gotson.komga.domain.model.LogLevel.INFO,
           "Resuming: $skippedCount/${allChapters.size} chapters already downloaded, ${filteredChapters.size} remaining",
         )
-
-        updateExistingCbzChapterUrls(destDir, allChapters, knownUrls, mangaInfo)
       } else {
         logger.debug { "No existing chapters found, downloading all ${allChapters.size} chapters" }
       }
@@ -846,7 +844,11 @@ class GalleryDlWrapper(
                       publishDate = chapter.publishDate,
                       language = chapter.language,
                     )
-                  addComicInfoToCbzWithChapterInfo(targetCbz.toPath(), mangaInfo, chapterInfo, chapter.chapterUrl)
+                  if (!comicInfoGenerator.hasComicInfoXml(targetCbz)) {
+                    addComicInfoToCbzWithChapterInfo(targetCbz.toPath(), mangaInfo, chapterInfo, chapter.chapterUrl)
+                  } else {
+                    logger.debug { "ComicInfo.xml already present from gallery-dl postprocessor: ${targetCbz.name}" }
+                  }
                   if (komgaSeriesId != null && !chapterUrlRepository.existsByUrl(chapter.chapterUrl)) {
                     val chapterNumVal =
                       chapter.chapterNumber
@@ -1042,82 +1044,10 @@ class GalleryDlWrapper(
     }
   }
 
-  private fun updateExistingCbzChapterUrls(
-    destDir: File,
-    allChapters: List<ChapterDownloadInfo>,
-    existingUrls: Set<String>,
-    mangaInfo: MangaInfo,
-  ) {
-    val cbzFiles =
-      destDir
-        .listFiles()
-        ?.filter { it.isFile && it.extension.lowercase() == "cbz" }
-        ?: return
-
-    val chaptersByNumber = mutableMapOf<String, MutableList<ChapterDownloadInfo>>()
-    for (ch in allChapters) {
-      val chNum = ch.chapterNumber ?: continue
-      val padded = chapterMatcher.padChapterNumber(chNum)
-      val plain =
-        try {
-          val n = chNum.toDouble()
-          if (n == n.toLong().toDouble()) n.toLong().toString() else chNum
-        } catch (_: NumberFormatException) {
-          chNum
-        }
-      chaptersByNumber.getOrPut(padded) { mutableListOf() }.add(ch)
-      if (plain != padded) {
-        chaptersByNumber.getOrPut(plain) { mutableListOf() }.add(ch)
-      }
-    }
-
-    var updated = 0
-    val alreadyUpdated = mutableSetOf<String>()
-    for (cbzFile in cbzFiles) {
-      if (cbzFile.absolutePath in alreadyUpdated) continue
-      if (comicInfoGenerator.hasComicInfoXml(cbzFile)) continue
-
-      val fileName = cbzFile.nameWithoutExtension
-      val nameLower = fileName.lowercase()
-      val chapterNum = chapterMatcher.extractChapterNumFromFilename(nameLower) ?: continue
-      val fileGroup = chapterMatcher.extractScanlationGroup(fileName)
-
-      val candidates = chaptersByNumber[chapterNum] ?: continue
-      val chapter =
-        if (fileGroup != null) {
-          candidates.find { it.scanlationGroup != null && fileGroup.equals(it.scanlationGroup, ignoreCase = true) }
-        } else {
-          candidates.firstOrNull()
-        } ?: continue
-
-      try {
-        val chapterInfo =
-          ChapterInfo(
-            chapterNumber = chapter.chapterNumber,
-            chapterTitle = chapter.chapterTitle,
-            volume = chapter.volume,
-            pages = chapter.pages,
-            scanlationGroup = chapter.scanlationGroup,
-            publishDate = chapter.publishDate,
-            language = chapter.language,
-          )
-        addComicInfoToCbzWithChapterInfo(cbzFile.toPath(), mangaInfo, chapterInfo, chapter.chapterUrl)
-        alreadyUpdated.add(cbzFile.absolutePath)
-        updated++
-        logger.debug { "Injected missing ComicInfo.xml into ${cbzFile.name}" }
-      } catch (e: Exception) {
-        logger.debug { "Failed to update ComicInfo.xml in ${cbzFile.name}: ${e.message}" }
-      }
-    }
-
-    if (updated > 0) {
-      logger.debug { "Existing CBZ update: $updated ComicInfo injected" }
-    }
-  }
-
   fun repairMissingComicInfo(
     mangaDexId: String,
     directories: List<File>,
+    forceReinject: Boolean = false,
   ): RepairResult {
     val mangaInfo =
       try {
@@ -1134,7 +1064,9 @@ class GalleryDlWrapper(
       }
 
     val chapterMap = mutableMapOf<String, MutableList<ChapterDownloadInfo>>()
+    val chapterUrlMap = mutableMapOf<String, ChapterDownloadInfo>()
     for (ch in allChapters) {
+      chapterUrlMap[ch.chapterUrl] = ch
       val num = ch.chapterNumber ?: continue
       val padded = chapterMatcher.padChapterNumber(num)
       val plain =
@@ -1160,14 +1092,15 @@ class GalleryDlWrapper(
 
       for (cbzFile in cbzFiles) {
         try {
-          val hasComment =
-            java.util.zip.ZipFile(cbzFile).use { zf ->
-              !zf.comment.isNullOrBlank()
+          if (!forceReinject) {
+            val hasComment =
+              java.util.zip.ZipFile(cbzFile).use { zf ->
+                !zf.comment.isNullOrBlank()
+              }
+            if (hasComment) {
+              skipped++
+              continue
             }
-
-          if (hasComment) {
-            skipped++
-            continue
           }
 
           val chapterNum =
@@ -1176,12 +1109,18 @@ class GalleryDlWrapper(
             chapterMatcher.extractScanlationGroup(cbzFile.nameWithoutExtension)
 
           val candidates = if (chapterNum != null) chapterMap[chapterNum] else null
-          val chapter =
+          val chapterByNum =
             if (candidates != null && fileGroup != null) {
               candidates.find { it.scanlationGroup?.equals(fileGroup, ignoreCase = true) == true }
                 ?: candidates.firstOrNull()
             } else {
               candidates?.firstOrNull()
+            }
+
+          val chapter =
+            chapterByNum ?: run {
+              val chapterId = chapterMatcher.extractChapterId(cbzFile.toPath())
+              if (chapterId != null) chapterUrlMap["https://mangadex.org/chapter/$chapterId"] else null
             }
 
           if (chapter != null) {
@@ -1374,6 +1313,7 @@ class GalleryDlWrapper(
     var scanlationGroup: String? = null
     val alternativeTitlesSet = mutableSetOf<String>()
     val alternativeTitlesWithLangMap = mutableMapOf<String, String>()
+    val genresSet = mutableSetOf<String>()
     var totalChapters = 0
     var category: String? = null
     var description: String? = null
@@ -1401,6 +1341,7 @@ class GalleryDlWrapper(
               },
               onAuthor = { if (author == null) author = it },
               onGroup = { if (scanlationGroup == null) scanlationGroup = it },
+              onGenres = { genresSet.addAll(it) },
             )
             if (category == null) category = metadata["category"] as? String
             if (title == null) {
@@ -1424,6 +1365,7 @@ class GalleryDlWrapper(
                 },
                 onAuthor = { if (author == null) author = it },
                 onGroup = { if (scanlationGroup == null) scanlationGroup = it },
+                onGenres = { genresSet.addAll(it) },
               )
               if (category == null) category = metadata["category"] as? String
               if (title == null) {
@@ -1447,6 +1389,7 @@ class GalleryDlWrapper(
               },
               onAuthor = { if (author == null) author = it },
               onGroup = { if (scanlationGroup == null) scanlationGroup = it },
+              onGenres = { genresSet.addAll(it) },
             )
           }
         }
@@ -1465,6 +1408,7 @@ class GalleryDlWrapper(
       alternativeTitles = alternativeTitlesSet.toList(),
       alternativeTitlesWithLanguage = alternativeTitlesWithLangMap,
       scanlationGroup = scanlationGroup,
+      genres = genresSet.toList(),
     )
   }
 
@@ -1475,6 +1419,7 @@ class GalleryDlWrapper(
     onAltTitles: (String, String) -> Unit,
     onAuthor: (String) -> Unit,
     onGroup: (String) -> Unit,
+    onGenres: (List<String>) -> Unit,
   ) {
     val mangaTitle = metadata["manga"] as? String
     val lang = metadata["lang"] as? String
@@ -1507,6 +1452,20 @@ class GalleryDlWrapper(
     val groups = metadata["group"] as? List<*>
     val firstGroup = groups?.firstOrNull() as? String
     if (firstGroup != null) onGroup(firstGroup)
+
+    @Suppress("UNCHECKED_CAST")
+    val genres = metadata["genres"] as? List<*>
+    if (genres != null) {
+      val stringGenres = genres.filterIsInstance<String>()
+      if (stringGenres.isNotEmpty()) onGenres(stringGenres)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    val tags = metadata["tags"] as? List<*>
+    if (tags != null) {
+      val stringTags = tags.filterIsInstance<String>()
+      if (stringTags.isNotEmpty()) onGenres(stringTags)
+    }
   }
 
   private fun detectLanguageFromTitle(title: String): String {

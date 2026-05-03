@@ -6,6 +6,117 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## [0.1.4.3] - 2026-05-27
+
+### New: gallery-dl-komga fork + komga postprocessor
+
+**gallery-dl fork:** All Dockerfiles and documentation now reference [gallery-dl-komga](https://github.com/08shiro80/gallery-dl-komga) (a Komga-specific fork of gallery-dl) instead of upstream PyPI `gallery-dl`. The fork adds:
+- New `komga` postprocessor: injects ComicInfo.xml into CBZ archives and writes series.json during the gallery-dl download itself — no extra API calls required
+
+**komga postprocessor integration:**
+- `GalleryDlProcess` adds the `komga` postprocessor (after `zip`); series.json from gallery-dl itself is disabled since `GalleryDlWrapper` writes a richer version
+- `GalleryDlWrapper` skips its own ComicInfo.xml injection when the postprocessor already added one (via `hasComicInfoXml()`)
+
+### New: Settings → Fixes page
+
+GUI-triggered one-time maintenance actions live under **Settings → Fixes**. Cards are versioned and removed once no longer needed.
+
+- **Re-inject ComicInfo.xml** — regenerates `ComicInfo.xml` + `series.json` for every CBZ in the selected library from MangaDex metadata. Enable Force to overwrite existing ComicInfo. Useful when MangaDex metadata has changed, when CBZs are missing ComicInfo, or to migrate libraries that ran an older fork build with different ComicInfo layout.
+
+### New: Auto-Match, Scrobbler, Metron (cherry-picked from jackohagan94-afk's v2.0 branch)
+
+Cherry-picked feature bundle originally authored by [jackohagan94-afk](https://github.com/jackohagan94-afk). Their PR was withdrawn upstream — integrated here with their attribution preserved on the new plugins.
+
+**New plugins (all disabled by default; Auto Metadata Match is enabled but hidden from the Search Online Databases dialog):**
+- **Metron Metadata Provider** — fetches comic series metadata from metron.cloud (free account required).
+- **Manga Scrobbler** (AniList / MyAnimeList / Kitsu / MangaDex) — pushes read progress when a book is marked completed. OAuth2 auto-refresh for MAL/Kitsu.
+- **Comic Scrobbler** (Metron) — pushes Western comic issue progress.
+- **Auto Metadata Match** — Komf-style: walks a configured provider priority (`anilist,mangadex,kitsu` by default), scores candidates by normalized-title Jaccard similarity, writes `web_url` + `tracker_links` to series.json. Registered as `PluginType.PROCESSOR` so it does NOT appear in the per-series "Search Online Databases" dialog (where it would not do anything useful). Bulk-run via `POST /api/v1/automatch/libraries/{id}`.
+
+**Infrastructure:**
+- New DB table `sync_state` (migration `V20260511000000`) tracks per-tracker submission state to avoid duplicate scrobbles
+- `TrackerLinkEnricher` writes multi-source tracker URLs into SeriesMetadata
+- `AutoMatchSeriesMetadata` task type + `TaskEmitter.autoMatchSeriesMetadata()` for queued matching
+- `RefreshSeriesMetadata` now best-effort runs auto-match inline (gated on plugin enabled + no existing link) before invoking the lifecycle refresh — no extra queued refresh
+
+**Mylar / status integration:**
+- `MylarSeriesProvider` now reads `web_url` (single URL) and `tracker_links` (list of `{label,url}`) from series.json and produces one WebLink per tracker. Falls back to the legacy MangaDex-UUID `comicid` link.
+- `MylarMetadata` DTO gains `tracker_links: List<TrackerLinkEntry>`
+- `Status` enum understands AniList/Kitsu uppercase strings (`RELEASING`, `ONGOING`, `COMPLETED`, `NOT_YET_RELEASED`, …) without custom mapping
+- `PluginController` writes a provider-aware `web_url` when a metadata plugin applies a result with an `externalId` + optional `provider` hint
+
+### New: MangaDex search on Downloads page
+
+Inspired by [beaux](https://github.com/beaux)'s `komga-enhanced` branch — re-implemented to reuse the existing `MangaDexMetadataPlugin.search()` (respects rate limiter + plugin content-rating config) instead of adding a separate `MangaDexProxyController`. UI sits at the top of `DownloadDashboard`:
+
+- Search MangaDex by title, pick a target library once via a dropdown
+- Per-result actions: **Download** (queues a new download) and **Follow** (appends `https://mangadex.org/title/<id>` to that library's `follow.txt` — dedupes if the URL is already there)
+- **Advanced filters** (collapsible panel): multi-select for *Include tags*, *Blacklist tags* (MangaDex `excludedTags[]`), Status, Content Rating, Publication Demographic, plus an *Only titles with downloadable chapters* toggle. Server-side `hasAvailableChapters=true` is too loose (counts external-link / 0-page chapters as "available"), so when this toggle is on the UI does an additional batch call to `POST /api/v1/plugins/mangadex-metadata/downloadable-check` which inspects each candidate's `/manga/{id}/feed` for at least one chapter with `externalUrl == null` AND `pages > 0` in the preferred language. **Trade-off:** 1 extra MangaDex API call per uncached result (24h server-side cache). With the toggle off there is zero extra cost. With no title and any filter set the button switches to "Browse" and queries MangaDex sorted by `followedCount desc`.
+- **Persistent filter defaults**: a "Save as default" button stores the current filter combination in browser `localStorage` (`komga-fork.mangadex-search-defaults`). On next visit the panel pre-fills with those values — set a permanent tag blacklist once and forget it. "Clear all" resets the current panel.
+- **Pagination** — 24 results per page with a `v-pagination` control underneath. `total` is reported by MangaDex (often tens of thousands when filters are loose). MangaDex caps `offset+limit ≤ 10000`, so the UI clamps to 417 pages max at the default 24/page.
+- **Tag catalog cached for 7 days in browser localStorage** (`komga-fork.mangadex-tags-cache`) — first visit hits `GET /api/v1/plugins/mangadex-metadata/tags`, subsequent visits use the local copy. Server-side in-memory cache (`getTags()`) survives until the JVM restarts. MangaDex changes its tag list only a handful of times per year.
+- **Follow button is a toggle** — already-followed titles show `Following` (success-coloured); clicking again locates the line in whichever library's `follow.txt` contains it and removes it. New follows still go to the currently-selected target library.
+- Cover images use a native `<img>` with `referrerpolicy="no-referrer"` to bypass MangaDex's anti-hotlinking (which otherwise replaces the cover with a "read on mangadex" placeholder when accessed from a non-localhost origin).
+- Theme-neutral (uses Vuetify `primary`, not hardcoded blue)
+- Status chips colored via the same enum mapping the rest of the fork uses (ongoing/releasing → primary, completed/ended/finished → success, hiatus → warning, cancelled → error)
+
+New backend endpoints on the MangaDex plugin:
+- `GET /api/v1/plugins/mangadex-metadata/tags` — returns cached MangaDex tag catalog (id, name, group) for the multi-select picker.
+- `POST /api/v1/plugins/mangadex-metadata/search-advanced` — body `{ query?, includedTagIds[], excludedTagIds[], status[], contentRating[], publicationDemographic[], hasAvailableChapters?, offset?, limit? }`. Returns `{ data: MetadataSearchResult[], total, offset, limit }` (paginated). Default `limit=24`, MangaDex caps `offset+limit ≤ 10000`. Empty query → `order[followedCount]=desc`.
+- `POST /api/v1/plugins/mangadex-metadata/downloadable-check` — body `{ language, ids[] }` → `{ uuid: boolean }`. Per-id 24h cache in `MangaDexMetadataPlugin.downloadableCache`. Returns true iff at least one chapter in `language` has `externalUrl == null` and `pages > 0`.
+
+**API rate-limit note:** All search calls (basic and advanced) go through the existing `MangaDexMetadataPlugin` against `api.mangadex.org` and count against MangaDex's global rate limits (~5 req/sec). Heavy search/browse will throttle (HTTP 429) for a few seconds before recovering — same behaviour as the rest of the fork's MangaDex traffic.
+
+### Fix: Re-inject ComicInfo crashed on CBZ files with STORED entries + EXT descriptor
+
+`ComicInfoGenerator.injectComicInfo` used `ZipInputStream`, which throws `ZipException: only DEFLATED entries can have EXT descriptor` on CBZ files repackaged by third-party tools. A single such file in a library would abort `repairMissingComicInfo` mid-loop and surface as a `504` from the Settings → Fixes UI. Rewrote `injectComicInfo`, `injectComicInfoWithRetry`, and `hasComicInfoXml` to use `ZipFile` instead, which tolerates that combination.
+
+### Other adjustments
+
+- **Shared MangaDex credentials across plugins**: `gallery-dl Downloader` is now the single source of truth for MangaDex authentication. Its schema gains `mangadex_client_id` and `mangadex_client_secret` alongside the existing `mangadex_username` / `mangadex_password`. **MangaDex Subscription Sync** and **Manga Scrobbler** auto-fall back to those values when their own equivalent fields are blank. Both `client_id/client_secret/username/password` on Subscription Sync and all four `mangadex_*` fields on the scrobbler are now optional. Resolution order: plugin's own field → gallery-dl → (scrobbler only) Subscription Sync.
+- **gallery-dl Downloader — chapter naming template**: new optional `chapter_naming` config field accepts a gallery-dl `directory` template string and applies it to all configured sites. Empty value keeps the per-site defaults. NOTE: `ChapterMatcher` still expects a `c<num>` token to extract chapter numbers from CBZ filenames — keep that in your template.
+- **DB hygiene — daily cleanup of log/event tables**: two new scheduled jobs run daily and delete entries older than 30 days:
+  - `PluginLogCleanupController` prunes `PLUGIN_LOG` (was unbounded; observed 119k+ rows in one install).
+  - `HistoricalEventCleanupController` prunes `HISTORICAL_EVENT` + `HISTORICAL_EVENT_PROPERTIES` together (no FK cascade in schema, so the DAO deletes properties first then events).
+- **Removed `updateExistingCbzChapterUrls` from gallery-dl download path**: 71-LOC function that re-walked every existing CBZ in a series on every download and re-injected missing ComicInfo.xml. The name lied (it never touched chapter URLs anymore), the work was redundant with the Re-inject ComicInfo card under Settings → Fixes, and it slowed down resumed downloads. Removed the function and its call site.
+
+| New / Modified File | Change |
+|---------------------|--------|
+| `infrastructure/download/GalleryDlProcess.kt` | `komga` postprocessor; `chapter_naming` template applied to all sites |
+| `infrastructure/download/GalleryDlWrapper.kt` | Skip ComicInfo injection if already present; `repairMissingComicInfo` gains `forceReinject`; `updateExistingCbzChapterUrls` removed |
+| `domain/persistence/PluginLogRepository.kt` + `infrastructure/jooq/main/PluginLogDao.kt` | `deleteOlderThan` re-added |
+| `domain/persistence/HistoricalEventRepository.kt` + `infrastructure/jooq/main/HistoricalEventDao.kt` | `deleteOlderThan` added (deletes properties then events) |
+| `interfaces/scheduler/PluginLogCleanupController.kt` | NEW — daily PLUGIN_LOG retention (30 days) |
+| `interfaces/scheduler/HistoricalEventCleanupController.kt` | NEW — daily HISTORICAL_EVENT retention (30 days) |
+| `komga-webui/src/views/DownloadDashboard.vue` | MangaDex search card with Download + Follow buttons (inspired by beaux's fork) |
+| `infrastructure/download/MangaDexApiClient.kt` | (existing behavior — all MangaDex tags in `<Genre>`) |
+| `infrastructure/download/ComicInfoGenerator.kt` | (existing behavior — only `<Genre>`) |
+| `interfaces/api/rest/DownloadController.kt` | `?force=true` for `repair-comicinfo` endpoint |
+| `komga-webui/src/views/SettingsFixes.vue` | NEW — Fixes page with Re-inject ComicInfo card |
+| `komga-webui/src/router.ts` | Route `/settings/fixes` |
+| `komga-webui/src/views/HomeView.vue` | "Fixes" navigation item under Settings |
+| `komga/docker/Dockerfile.local` + `Dockerfile.tpl` | Use `gallery-dl-komga` fork tarball instead of PyPI |
+| `README.md` | Install/update instructions for `gallery-dl-komga` |
+| `infrastructure/automatch/*` (5 files) | NEW — TitleNormalizer, Matcher, Applier, EventListener, SeriesJsonWriter |
+| `infrastructure/metadata/metron/*` (2 files) | NEW — Metron HTTP client + Plugin |
+| `infrastructure/scrobbler/*` (4 files) | NEW — MangaScrobbler, MangaSyncPuller, TrackerIdResolver, PluginVersions |
+| `infrastructure/comicscrobbler/ComicScrobblerPlugin.kt` | NEW — Metron-based comic scrobbler |
+| `infrastructure/metadata/tracker/TrackerLinkEnricher.kt` | NEW |
+| `infrastructure/rate/MetronRateLimiter.kt` | NEW |
+| `infrastructure/jooq/main/SyncStateDao.kt` | NEW |
+| `domain/model/SyncState.kt` + `domain/persistence/SyncStateRepository.kt` | NEW |
+| `flyway/.../V20260511000000__add_sync_state.sql` | NEW |
+| `interfaces/api/rest/AutoMatchController.kt` | NEW — bulk match endpoint |
+| `application/tasks/Task.kt` + `TaskEmitter.kt` + `TaskHandler.kt` | New AutoMatchSeriesMetadata task |
+| `application/startup/PluginInitializer.kt` | 4 new plugin definitions; auto-metadata registered as `PROCESSOR`; `chapter_naming` field on gallery-dl |
+| `interfaces/api/rest/PluginController.kt` | `provider` field on DTO; status alias expansion; provider-aware `web_url` |
+| `infrastructure/metadata/mylar/MylarSeriesProvider.kt` | Multi-tracker WebLink generation |
+| `infrastructure/metadata/mylar/dto/MylarMetadata.kt` | `tracker_links` field |
+| `infrastructure/metadata/mylar/dto/Status.kt` | More JsonAlias for AniList/Kitsu |
+| `infrastructure/scrobbler/MangaScrobblerPlugin.kt` | MangaDex credential fallback to MangaDex Subscription Sync |
+
+---
+
 ## [0.1.4.2] - 2026-05-02
 
 ### New Features
@@ -32,7 +143,7 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## [0.1.4.1] - 2026-04-26 — Upstream merge: 1.24.4
+## [0.1.4.1] - 2026-04-26
 
 ### Upstream Fixes (from Komga 1.24.4)
 
@@ -44,10 +155,6 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 | `interfaces/api/opds/v2/Opds2Controller.kt` | OPDS2: `series/latest` Navigation-Link-Fix |
 | `interfaces/api/OpdsGenerator.kt` | OPDS2: Auth-Logo-URL korrekt bei Base-URL |
 | `interfaces/api/rest/dto/UserDto.kt` | API: `ageRestriction` wird ausgeblendet statt als `null` gesendet |
-
----
-
-## [0.1.4.1] - 2026-04-12
 
 ### Bug Fixes
 - **Page hashes wiped on every re-analyze — duplicate count collapses during scans** — `BookLifecycle.analyzeAndPersist` called `mediaRepository.update(media)` with the fresh `Media` returned by `BookAnalyzer.analyze`, which constructs brand-new `BookPage` objects in `analyzeDivina` without a `fileHash` (defaults to `""`). Any time a book was marked `OUTDATED` (mtime change without `hashFiles` enabled, or actual content change), all previously computed page hashes were dropped, `getBookIdsWithMissingPageHash` re-enqueued the book, and `hashPages` re-read every first/last N page from disk again. During a library scan this also caused the Duplicate Pages / Unknown view to collapse (e.g. 22×50 rows → 2) because the `findAllUnknown` query counts pages with `FILE_HASH != ''` and the re-analyze pass had just blanked them. Fix: `analyzeAndPersist` now reads the previous `Media` inside the transaction and runs `media.pages.restoreHashFrom(previous.pages)` before persisting — the same helper already used by `BookConverter` and `BookPageEditor` matches pages by `fileName + fileSize + mediaType` and copies the old `fileHash` forward. Pages that genuinely changed (different size or renamed) still get re-hashed; untouched pages keep their hash across scans.

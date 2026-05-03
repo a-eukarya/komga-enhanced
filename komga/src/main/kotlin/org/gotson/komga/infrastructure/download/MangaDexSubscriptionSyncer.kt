@@ -162,7 +162,21 @@ class MangaDexSubscriptionSyncer(
     logger.info { "MangaDex Subscription syncer stopped" }
   }
 
-  private fun loadConfig(): Map<String, String?> = pluginConfigRepository.findByPluginId(pluginId).associate { it.configKey to it.configValue }
+  private fun loadConfig(): Map<String, String?> {
+    val own = pluginConfigRepository.findByPluginId(pluginId).associate { it.configKey to it.configValue }
+    val galleryDl = pluginConfigRepository.findByPluginId("gallery-dl-downloader").associate { it.configKey to it.configValue }
+    return own.toMutableMap().apply {
+      // Fallback to gallery-dl Downloader for shared MangaDex credentials when blank/missing
+      mapOf(
+        "client_id" to "mangadex_client_id",
+        "client_secret" to "mangadex_client_secret",
+        "username" to "mangadex_username",
+        "password" to "mangadex_password",
+      ).forEach { (ours, theirs) ->
+        if (this[ours].isNullOrBlank()) galleryDl[theirs]?.takeIf { it.isNotBlank() }?.let { this[ours] = it }
+      }
+    }
+  }
 
   private fun hasRequiredCredentials(config: Map<String, String?>): Boolean =
     !config["client_id"].isNullOrBlank() &&

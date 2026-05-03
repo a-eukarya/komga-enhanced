@@ -11,6 +11,9 @@ import org.gotson.komga.domain.service.OnlineMetadataProvider
 import org.springframework.stereotype.Service
 import org.springframework.web.client.RestClient
 import org.springframework.web.client.RestClientException
+import java.time.Duration
+import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 
 private val logger = KotlinLogging.logger {}
 
@@ -248,6 +251,229 @@ class MangaDexMetadataPlugin(
     }
   }
 
+  fun searchAdvanced(
+    query: String?,
+    includedTagIds: List<String>,
+    excludedTagIds: List<String>,
+    status: List<String>,
+    contentRating: List<String>,
+    publicationDemographic: List<String>,
+    hasAvailableChapters: Boolean?,
+    offset: Int,
+    limit: Int,
+  ): MangaDexSearchPage {
+    return try {
+      val preferredLang = getPreferredLanguage()
+      val effectiveRatings =
+        contentRating.ifEmpty {
+          listOf("safe", "suggestive", "erotica", "pornographic")
+        }
+      val effectiveLimit = limit.coerceIn(1, 100)
+      val effectiveOffset = offset.coerceAtLeast(0)
+
+      val response =
+        restClient
+          .get()
+          .uri { builder ->
+            builder.path("/manga")
+            builder.queryParam("limit", effectiveLimit)
+            builder.queryParam("offset", effectiveOffset)
+            builder.queryParam("includes[]", "cover_art")
+            builder.queryParam("includes[]", "author")
+            builder.queryParam("includes[]", "artist")
+            if (!query.isNullOrBlank()) builder.queryParam("title", query)
+            includedTagIds.forEach { builder.queryParam("includedTags[]", it) }
+            excludedTagIds.forEach { builder.queryParam("excludedTags[]", it) }
+            status.forEach { builder.queryParam("status[]", it) }
+            effectiveRatings.forEach { builder.queryParam("contentRating[]", it) }
+            publicationDemographic.forEach { builder.queryParam("publicationDemographic[]", it) }
+            if (hasAvailableChapters == true) builder.queryParam("hasAvailableChapters", "true")
+            if (query.isNullOrBlank()) builder.queryParam("order[followedCount]", "desc")
+            builder.build()
+          }.retrieve()
+          .body(String::class.java) ?: return MangaDexSearchPage(emptyList(), 0, effectiveOffset, effectiveLimit)
+
+      val data = parseSearchResponse(response, preferredLang)
+      val total = objectMapper.readTree(response).get("total")?.asInt() ?: data.size
+      MangaDexSearchPage(data, total, effectiveOffset, effectiveLimit)
+    } catch (e: RestClientException) {
+      logger.error(e) { "Error in MangaDex advanced search" }
+      MangaDexSearchPage(emptyList(), 0, offset, limit)
+    } catch (e: Exception) {
+      logger.error(e) { "Unexpected error in MangaDex advanced search" }
+      MangaDexSearchPage(emptyList(), 0, offset, limit)
+    }
+  }
+
+  // 24h cache for "does this manga have downloadable chapters in <language>?"
+  private val downloadableCache = ConcurrentHashMap<Pair<String, String>, Pair<Boolean, Instant>>()
+  private val downloadableCacheTtl = Duration.ofHours(24)
+
+  /**
+   * True when MangaDex has at least one chapter for `mangaId` in `language` that is
+   * actually downloadable: `externalUrl == null` (not a webnovel/comico/etc. link)
+   * AND `pages > 0`. Cached per (mangaId, language) for 24h.
+   *
+   * Costs one extra `/manga/{id}/feed` call per uncached manga — call sparingly.
+   */
+  fun hasDownloadableChapters(
+    mangaId: String,
+    language: String,
+  ): Boolean {
+    val key = mangaId to language
+    downloadableCache[key]?.let { (value, ts) ->
+      if (Instant.now().isBefore(ts.plus(downloadableCacheTtl))) return value
+    }
+    val result = computeHasDownloadable(mangaId, language)
+    downloadableCache[key] = result to Instant.now()
+    return result
+  }
+
+  private fun computeHasDownloadable(
+    mangaId: String,
+    language: String,
+  ): Boolean {
+    try {
+      val response =
+        restClient
+          .get()
+          .uri { builder ->
+            builder.path("/manga/$mangaId/feed")
+            builder.queryParam("translatedLanguage[]", language)
+            builder.queryParam("contentRating[]", "safe")
+            builder.queryParam("contentRating[]", "suggestive")
+            builder.queryParam("contentRating[]", "erotica")
+            builder.queryParam("contentRating[]", "pornographic")
+            builder.queryParam("limit", 100)
+            builder.queryParam("order[chapter]", "asc")
+            builder.build()
+          }.retrieve()
+          .body(String::class.java) ?: return false
+      val data = objectMapper.readTree(response).get("data") ?: return false
+      if (!data.isArray) return false
+      return data.any { item ->
+        val attrs = item.get("attributes")
+        if (attrs == null) {
+          false
+        } else {
+          val hasExternalUrl = attrs.hasNonNull("externalUrl") && attrs.get("externalUrl").asText().isNotBlank()
+          val pages = attrs.get("pages")?.asInt() ?: 0
+          !hasExternalUrl && pages > 0
+        }
+      }
+    } catch (e: Exception) {
+      logger.warn(e) { "downloadable-check failed for $mangaId ($language) — assuming false" }
+      return false
+    }
+  }
+
+  @Volatile private var cachedTags: List<MangaDexTag>? = null
+
+  fun getTags(): List<MangaDexTag> {
+    cachedTags?.let { return it }
+    return try {
+      val response =
+        restClient
+          .get()
+          .uri("/manga/tag")
+          .retrieve()
+          .body(String::class.java)
+          ?: return emptyList()
+      val json = objectMapper.readTree(response)
+      val data = json.get("data") ?: return emptyList()
+      if (!data.isArray) return emptyList()
+      val tags =
+        data
+          .mapNotNull { item ->
+            val id = item.get("id")?.asText() ?: return@mapNotNull null
+            val attrs = item.get("attributes") ?: return@mapNotNull null
+            val name =
+              attrs
+                .get("name")
+                ?.get("en")
+                ?.asText()
+                ?: attrs
+                  .get("name")
+                  ?.fields()
+                  ?.next()
+                  ?.value
+                  ?.asText()
+                ?: return@mapNotNull null
+            val group = attrs.get("group")?.asText() ?: "other"
+            MangaDexTag(id = id, name = name, group = group)
+          }.sortedWith(compareBy({ it.group }, { it.name }))
+      cachedTags = tags
+      tags
+    } catch (e: Exception) {
+      logger.error(e) { "Failed to fetch MangaDex tag list" }
+      emptyList()
+    }
+  }
+
+  private fun parseSearchResponse(
+    response: String,
+    preferredLang: String,
+  ): List<MetadataSearchResult> {
+    val json = objectMapper.readTree(response)
+    val dataArray = json.get("data") ?: return emptyList()
+    if (!dataArray.isArray) return emptyList()
+    return dataArray.map { item ->
+      val id = item.get("id").asText()
+      val attributes = item.get("attributes")
+      val title = extractTitle(attributes.get("title"), preferredLang)
+      val description = extractDescription(attributes.get("description"), preferredLang)
+      val status = attributes.get("status")?.asText()
+      val year = attributes.get("year")?.asInt()
+      val tags =
+        attributes
+          .get("tags")
+          ?.mapNotNull { tag ->
+            val nameNode =
+              tag
+                .get("attributes")
+                ?.get("name")
+            nameNode
+              ?.get(preferredLang)
+              ?.asText()
+              ?: nameNode
+                ?.get("en")
+                ?.asText()
+              ?: nameNode
+                ?.fields()
+                ?.next()
+                ?.value
+                ?.asText()
+          }?.filter { it.isNotEmpty() } ?: emptyList()
+      var coverUrl: String? = null
+      var author: String? = null
+      val relationships = item.get("relationships")
+      if (relationships != null && relationships.isArray) {
+        for (rel in relationships) {
+          when (rel.get("type")?.asText()) {
+            "cover_art" -> {
+              val fileName = rel.get("attributes")?.get("fileName")?.asText()
+              if (fileName != null && coverUrl == null) {
+                coverUrl = "https://uploads.mangadex.org/covers/$id/$fileName.256.jpg"
+              }
+            }
+            "author" -> if (author == null) author = rel.get("attributes")?.get("name")?.asText()
+          }
+        }
+      }
+      MetadataSearchResult(
+        externalId = id,
+        title = title,
+        description = description,
+        coverUrl = coverUrl,
+        author = author,
+        year = year,
+        status = status,
+        tags = tags,
+        provider = "MangaDex",
+      )
+    }
+  }
+
   override fun getMetadata(externalId: String): MetadataDetails? {
     return try {
       logger.info { "Fetching MangaDex metadata for ID: $externalId" }
@@ -353,3 +579,16 @@ class MangaDexMetadataPlugin(
 }
 
 private fun String.capitalize() = replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+
+data class MangaDexTag(
+  val id: String,
+  val name: String,
+  val group: String,
+)
+
+data class MangaDexSearchPage(
+  val data: List<MetadataSearchResult>,
+  val total: Int,
+  val offset: Int,
+  val limit: Int,
+)

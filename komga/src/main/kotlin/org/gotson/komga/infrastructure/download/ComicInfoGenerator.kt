@@ -8,7 +8,6 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
-import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 private val logger = KotlinLogging.logger {}
@@ -86,28 +85,21 @@ class ComicInfoGenerator {
   ) {
     val tempFile = cbzPath.resolveSibling("${cbzPath.fileName}.comicinfo.tmp")
     try {
-      val allEntries = mutableListOf<Pair<ZipEntry, ByteArray>>()
-
-      ZipInputStream(Files.newInputStream(cbzPath)).use { zipIn ->
-        var entry = zipIn.nextEntry
-        while (entry != null) {
-          if (entry.name != "ComicInfo.xml") {
-            allEntries.add(entry to zipIn.readBytes())
-          }
-          entry = zipIn.nextEntry
-        }
-      }
-
-      ZipOutputStream(Files.newOutputStream(tempFile)).use { zipOut ->
-        zipOut.setComment(zipComment)
-        zipOut.putNextEntry(ZipEntry("ComicInfo.xml"))
-        zipOut.write(comicInfoXml.toByteArray(Charsets.UTF_8))
-        zipOut.closeEntry()
-
-        for ((entry, data) in allEntries) {
-          zipOut.putNextEntry(ZipEntry(entry.name))
-          zipOut.write(data)
+      // ZipFile is tolerant of STORED entries with EXT descriptors that
+      // ZipInputStream rejects ("only DEFLATED entries can have EXT descriptor").
+      ZipFile(cbzPath.toFile()).use { zin ->
+        ZipOutputStream(Files.newOutputStream(tempFile)).use { zipOut ->
+          zipOut.setComment(zipComment)
+          zipOut.putNextEntry(ZipEntry("ComicInfo.xml"))
+          zipOut.write(comicInfoXml.toByteArray(Charsets.UTF_8))
           zipOut.closeEntry()
+
+          for (entry in zin.entries()) {
+            if (entry.name == "ComicInfo.xml") continue
+            zipOut.putNextEntry(ZipEntry(entry.name))
+            zin.getInputStream(entry).use { it.copyTo(zipOut) }
+            zipOut.closeEntry()
+          }
         }
       }
 
@@ -129,32 +121,21 @@ class ComicInfoGenerator {
       val tempFile = cbzPath.resolveSibling("${cbzPath.fileName}.tmp")
       try {
         try {
-          val allEntries = mutableListOf<Pair<ZipEntry, ByteArray>>()
+          ZipFile(cbzPath.toFile()).use { zin ->
+            ZipOutputStream(Files.newOutputStream(tempFile)).use { zipOut ->
+              zipOut.setComment(zipComment)
+              val writtenEntries = mutableSetOf<String>()
 
-          ZipInputStream(Files.newInputStream(cbzPath)).use { zipIn ->
-            var entry = zipIn.nextEntry
-            while (entry != null) {
-              if (entry.name != "ComicInfo.xml") {
-                allEntries.add(entry to zipIn.readBytes())
-              }
-              entry = zipIn.nextEntry
-            }
-          }
+              zipOut.putNextEntry(ZipEntry("ComicInfo.xml"))
+              zipOut.write(comicInfoXml.toByteArray(Charsets.UTF_8))
+              zipOut.closeEntry()
+              writtenEntries.add("ComicInfo.xml")
 
-          ZipOutputStream(Files.newOutputStream(tempFile)).use { zipOut ->
-            zipOut.setComment(zipComment)
-            val writtenEntries = mutableSetOf<String>()
-
-            zipOut.putNextEntry(ZipEntry("ComicInfo.xml"))
-            zipOut.write(comicInfoXml.toByteArray(Charsets.UTF_8))
-            zipOut.closeEntry()
-            writtenEntries.add("ComicInfo.xml")
-
-            for ((entry, data) in allEntries) {
-              if (entry.name !in writtenEntries) {
+              for (entry in zin.entries()) {
+                if (entry.name in writtenEntries) continue
                 writtenEntries.add(entry.name)
                 zipOut.putNextEntry(ZipEntry(entry.name))
-                zipOut.write(data)
+                zin.getInputStream(entry).use { it.copyTo(zipOut) }
                 zipOut.closeEntry()
               }
             }
@@ -180,21 +161,13 @@ class ComicInfoGenerator {
     }
   }
 
-  fun hasComicInfoXml(cbzFile: File): Boolean {
+  fun hasComicInfoXml(cbzFile: File): Boolean =
     try {
-      ZipInputStream(cbzFile.inputStream().buffered()).use { zipIn ->
-        var entry = zipIn.nextEntry
-        while (entry != null) {
-          if (entry.name == "ComicInfo.xml") return true
-          entry = zipIn.nextEntry
-        }
-      }
+      ZipFile(cbzFile).use { it.getEntry("ComicInfo.xml") != null }
     } catch (e: Exception) {
       logger.warn(e) { "Failed to check ComicInfo.xml in ${cbzFile.name}" }
-      return false
+      false
     }
-    return false
-  }
 
   fun verifyZipComment(cbzPath: Path) {
     try {

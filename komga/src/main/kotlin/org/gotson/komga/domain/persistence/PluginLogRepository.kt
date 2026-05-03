@@ -4,6 +4,7 @@ import org.gotson.komga.domain.model.LogLevel
 import org.gotson.komga.domain.model.PluginLog
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
+import java.time.LocalDateTime
 
 interface PluginLogRepository {
   fun findByPluginId(
@@ -20,4 +21,6 @@ interface PluginLogRepository {
   fun insert(log: PluginLog)
 
   fun deleteByPluginId(pluginId: String)
+
+  fun deleteOlderThan(dateTime: LocalDateTime)
 }

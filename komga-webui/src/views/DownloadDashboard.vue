@@ -95,6 +95,235 @@
         </v-col>
       </v-row>
 
+      <!-- MangaDex Search -->
+      <v-row class="mb-2">
+        <v-col cols="12">
+          <v-card outlined>
+            <v-card-title class="flex-wrap pb-2">
+              <v-icon left color="primary">mdi-magnify</v-icon>
+              <span class="text-subtitle-1 text-sm-h6">Find Manga on MangaDex</span>
+            </v-card-title>
+            <v-card-text class="pb-2">
+              <v-row align="center" dense>
+                <v-col cols="12" sm="5" md="5">
+                  <v-text-field
+                    v-model="searchQuery"
+                    label="Search title..."
+                    outlined
+                    dense
+                    hide-details
+                    clearable
+                    prepend-inner-icon="mdi-magnify"
+                    :loading="searchLoading"
+                    @keyup.enter="searchMangaDex"
+                  />
+                </v-col>
+                <v-col cols="12" sm="4" md="4">
+                  <v-select
+                    v-model="searchLibraryId"
+                    :items="libraries"
+                    item-text="name"
+                    item-value="id"
+                    label="Target library"
+                    outlined
+                    dense
+                    hide-details
+                  />
+                </v-col>
+                <v-col cols="12" sm="3" md="3">
+                  <v-btn color="primary" depressed block @click="searchMangaDex" :loading="searchLoading" :disabled="!searchQuery && !hasFilters">
+                    <v-icon left>mdi-magnify</v-icon>
+                    {{ searchQuery ? 'Search' : 'Browse' }}
+                  </v-btn>
+                </v-col>
+              </v-row>
+
+              <v-expansion-panels flat tile v-model="advancedPanel" class="mt-2">
+                <v-expansion-panel>
+                  <v-expansion-panel-header class="px-0 py-1 text--secondary">
+                    <span>
+                      <v-icon small left>mdi-filter-variant</v-icon>
+                      Advanced filters (random browse when title is empty)
+                      <v-chip v-if="hasFilters" x-small color="primary" class="ml-2">{{ activeFilterCount }} active</v-chip>
+                    </span>
+                  </v-expansion-panel-header>
+                  <v-expansion-panel-content class="pa-0">
+                    <v-row dense>
+                      <v-col cols="12" md="6">
+                        <v-autocomplete
+                          v-model="filterTags"
+                          :items="tagOptions"
+                          item-text="name"
+                          item-value="id"
+                          label="Include tags / genres"
+                          multiple chips small-chips deletable-chips
+                          outlined dense hide-details
+                          :loading="loadingTags"
+                          @focus="loadTagsIfNeeded"
+                        >
+                          <template v-slot:item="{ item }">
+                            <v-list-item-content>
+                              <v-list-item-title>{{ item.name }}</v-list-item-title>
+                              <v-list-item-subtitle class="caption">{{ item.group }}</v-list-item-subtitle>
+                            </v-list-item-content>
+                          </template>
+                        </v-autocomplete>
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-autocomplete
+                          v-model="filterExcludedTags"
+                          :items="tagOptions"
+                          item-text="name"
+                          item-value="id"
+                          label="Blacklist tags / genres"
+                          multiple chips small-chips deletable-chips
+                          outlined dense hide-details
+                          :loading="loadingTags"
+                          @focus="loadTagsIfNeeded"
+                          color="error"
+                          item-color="error"
+                        >
+                          <template v-slot:item="{ item }">
+                            <v-list-item-content>
+                              <v-list-item-title>{{ item.name }}</v-list-item-title>
+                              <v-list-item-subtitle class="caption">{{ item.group }}</v-list-item-subtitle>
+                            </v-list-item-content>
+                          </template>
+                        </v-autocomplete>
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-select
+                          v-model="filterStatus"
+                          :items="['ongoing','completed','hiatus','cancelled']"
+                          label="Status" multiple chips small-chips deletable-chips
+                          outlined dense hide-details
+                        />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-select
+                          v-model="filterRating"
+                          :items="['safe','suggestive','erotica','pornographic']"
+                          label="Content rating" multiple chips small-chips deletable-chips
+                          outlined dense hide-details
+                          hint="Empty = all"
+                          persistent-hint
+                        />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-select
+                          v-model="filterDemographic"
+                          :items="['shounen','shoujo','seinen','josei','none']"
+                          label="Publication demographic" multiple chips small-chips deletable-chips
+                          outlined dense hide-details
+                        />
+                      </v-col>
+                      <v-col cols="12" md="6" class="d-flex align-center">
+                        <v-switch
+                          v-model="filterAvailableOnly"
+                          label="Only titles with downloadable chapters"
+                          hint="1 extra MangaDex API call per result (24h cache). Hides external-link / 0-page chapters."
+                          persistent-hint
+                          dense
+                          class="mt-0"
+                        />
+                      </v-col>
+                      <v-col cols="12" md="6" class="d-flex align-center">
+                        <v-switch
+                          v-model="filterHideFollowed"
+                          label="Hide titles already in any follow.txt"
+                          hide-details
+                          dense
+                          class="mt-0"
+                        />
+                      </v-col>
+                      <v-col cols="12" class="d-flex align-center pt-2">
+                        <v-btn small text @click="saveFilterDefaults" :color="filtersDirty ? 'primary' : ''">
+                          <v-icon small left>mdi-content-save</v-icon>
+                          {{ filtersDirty ? 'Save as default' : 'Saved as default' }}
+                        </v-btn>
+                        <v-btn small text @click="clearFilters">
+                          <v-icon small left>mdi-close</v-icon>
+                          Clear all
+                        </v-btn>
+                        <v-spacer />
+                        <span class="caption text--secondary">Defaults are stored per browser (localStorage)</span>
+                      </v-col>
+                    </v-row>
+                  </v-expansion-panel-content>
+                </v-expansion-panel>
+              </v-expansion-panels>
+
+              <v-row v-if="searchResults.length > 0" class="mt-2" dense>
+                <v-col
+                  v-for="manga in searchResults"
+                  :key="manga.externalId"
+                  cols="4" sm="3" md="2" lg="2"
+                  style="min-width:130px;max-width:180px;"
+                >
+                  <v-card outlined height="100%" class="d-flex flex-column">
+                    <div class="grey lighten-3 d-flex align-center justify-center" style="width:100%;padding-top:150%;position:relative;">
+                      <img
+                        v-if="manga.coverUrl"
+                        :src="manga.coverUrl"
+                        referrerpolicy="no-referrer"
+                        alt=""
+                        style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;"
+                      />
+                      <v-icon v-else color="grey lighten-1" style="position:absolute;">mdi-book-open-page-variant</v-icon>
+                    </div>
+                    <v-card-text class="pa-1 flex-grow-1">
+                      <div class="text-caption font-weight-bold" style="line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">{{ manga.title }}</div>
+                      <v-chip v-if="manga.status" x-small class="mt-1" :color="statusColor(manga.status)">{{ manga.status }}</v-chip>
+                    </v-card-text>
+                    <v-card-actions class="pa-1 pt-0 flex-column">
+                      <v-btn
+                        x-small block depressed
+                        :color="searchAction[manga.externalId] === 'downloaded' ? 'success' : searchAction[manga.externalId] === 'error' ? 'error' : 'primary'"
+                        :loading="searchBusy[manga.externalId + ':dl']"
+                        :disabled="!!searchAction[manga.externalId]"
+                        @click="downloadFromSearch(manga)"
+                      >
+                        <v-icon x-small left>{{ searchAction[manga.externalId] === 'downloaded' ? 'mdi-check' : 'mdi-download' }}</v-icon>
+                        {{ searchAction[manga.externalId] === 'downloaded' ? 'Queued' : 'Download' }}
+                      </v-btn>
+                      <v-btn
+                        x-small block depressed outlined
+                        class="mt-1 mx-0"
+                        :color="isFollowed(manga) ? 'success' : (searchFollow[manga.externalId] === 'error' ? 'error' : '')"
+                        :loading="searchBusy[manga.externalId + ':fl']"
+                        @click="toggleFollow(manga)"
+                      >
+                        <v-icon x-small left>{{ isFollowed(manga) ? 'mdi-check' : 'mdi-playlist-plus' }}</v-icon>
+                        {{ isFollowed(manga) ? 'Following' : 'Follow' }}
+                      </v-btn>
+                    </v-card-actions>
+                  </v-card>
+                </v-col>
+              </v-row>
+
+              <div v-if="searchDone && searchResults.length === 0 && !searchLoading" class="text-center py-2 text--secondary">
+                No results found{{ lastSearchSkippedNote }}
+              </div>
+
+              <v-alert v-if="followedUuidsLoadError" type="warning" dense text class="mt-2 mb-0">
+                Could not read follow.txt from: {{ followedUuidsLoadError }}
+              </v-alert>
+
+              <div v-if="searchDone && searchPageCount > 1" class="d-flex align-center justify-center mt-2">
+                <v-pagination
+                  :value="searchPage"
+                  :length="searchPageCount"
+                  :total-visible="7"
+                  @input="onSearchPageChange"
+                  :disabled="searchLoading"
+                />
+                <span class="caption text--secondary ml-3">{{ searchTotal }} total</span>
+              </div>
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+
       <!-- Download Queue (All) -->
       <v-row>
         <v-col cols="12">
@@ -567,9 +796,79 @@ export default {
       tachiyomiLibraryId: null,
       importingTachiyomi: false,
       tachiyomiResult: null,
+      // MangaDex search (top of page)
+      searchQuery: '',
+      searchLibraryId: null,
+      searchResults: [],
+      searchLoading: false,
+      searchDone: false,
+      searchBusy: {},
+      searchAction: {},
+      searchFollow: {},
+      // Advanced filters
+      advancedPanel: null,
+      filterTags: [],
+      filterExcludedTags: [],
+      filterStatus: [],
+      filterRating: [],
+      filterDemographic: [],
+      filterAvailableOnly: false,
+      filterHideFollowed: false,
+      tagOptions: [],
+      loadingTags: false,
+      savedFiltersHash: '',
+      lastSearchSkippedAvailable: 0,
+      lastSearchSkippedFollow: 0,
+      // Pagination
+      searchPageSize: 24,
+      searchPage: 1,
+      searchTotal: 0,
+      followedUuids: [],
+      followedUuidsLoadError: '',
     }
   },
   computed: {
+    currentFilterPayload() {
+      return {
+        t: [...(this.filterTags || [])].sort(),
+        x: [...(this.filterExcludedTags || [])].sort(),
+        s: [...(this.filterStatus || [])].sort(),
+        r: [...(this.filterRating || [])].sort(),
+        d: [...(this.filterDemographic || [])].sort(),
+        a: !!this.filterAvailableOnly,
+        h: !!this.filterHideFollowed,
+      }
+    },
+    currentFilterHash() {
+      return JSON.stringify(this.currentFilterPayload)
+    },
+    filtersDirty() {
+      return this.currentFilterHash !== this.savedFiltersHash
+    },
+    hasFilters() {
+      return this.activeFilterCount > 0
+    },
+    lastSearchSkippedNote() {
+      const parts = []
+      if (this.lastSearchSkippedFollow > 0) parts.push(`${this.lastSearchSkippedFollow} already in follow.txt`)
+      if (this.lastSearchSkippedAvailable > 0) parts.push(`${this.lastSearchSkippedAvailable} without downloadable chapters`)
+      return parts.length > 0 ? ` (${parts.join(', ')} hidden)` : ''
+    },
+    searchPageCount() {
+      if (!this.searchTotal || this.searchTotal <= this.searchPageSize) return 1
+      return Math.min(Math.ceil(this.searchTotal / this.searchPageSize), 417)
+    },
+    activeFilterCount() {
+      let n = 0
+      if (this.filterTags && this.filterTags.length > 0) n++
+      if (this.filterExcludedTags && this.filterExcludedTags.length > 0) n++
+      if (this.filterStatus && this.filterStatus.length > 0) n++
+      if (this.filterRating && this.filterRating.length > 0) n++
+      if (this.filterDemographic && this.filterDemographic.length > 0) n++
+      if (this.filterAvailableOnly) n++
+      if (this.filterHideFollowed) n++
+      return n
+    },
     allDownloads() {
       return this.downloads
     },
@@ -601,6 +900,10 @@ export default {
     this.loadLibraries()
     this.loadSchedulerSettings()
     this.loadMangaDexPluginStatus()
+    this.loadFilterDefaults()
+    // Eagerly fetch the tag catalog so chips/labels in restored defaults
+    // resolve to names instead of bare UUIDs without waiting for focus.
+    this.loadTagsIfNeeded()
     this.setupSseListeners()
   },
   beforeDestroy() {
@@ -622,12 +925,244 @@ export default {
       try {
         const response = await this.$komgaLibraries.getLibraries()
         this.libraries = response
-        // Auto-select first library
         if (this.libraries.length > 0) {
           this.selectLibrary(0)
+          if (!this.searchLibraryId) this.searchLibraryId = this.libraries[0].id
         }
+        this.refreshFollowedUuids()
       } catch (error) {
         // Library loading failed
+      }
+    },
+
+    // ── MangaDex Search (top of page) ─────────────────────────────────────
+    statusColor(status) {
+      return {
+        ongoing: 'primary', releasing: 'primary',
+        completed: 'success', ended: 'success', finished: 'success',
+        hiatus: 'warning',
+        cancelled: 'error', canceled: 'error',
+      }[String(status || '').toLowerCase()] || 'grey'
+    },
+    async refreshFollowedUuids() {
+      const seen = new Set()
+      const errors = []
+      const fetches = (this.libraries || []).map(lib =>
+        this.$http.get(`/api/v1/downloads/follow-txt/${lib.id}`).then(r => {
+          const content = (r.data && r.data.content) || ''
+          const re = /mangadex\.org\/(?:title|manga)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi
+          let m
+          while ((m = re.exec(content)) !== null) {
+            seen.add(m[1].toLowerCase())
+          }
+        }).catch(e => {
+          errors.push(`${lib && lib.name}: ${(e && e.message) || 'unknown'}`)
+        }),
+      )
+      await Promise.all(fetches)
+      this.followedUuids = Array.from(seen)
+      this.followedUuidsLoadError = errors.length > 0 ? errors.join('; ') : ''
+    },
+    isFollowed(manga) {
+      return this.followedUuids.indexOf(String(manga.externalId || '').toLowerCase()) >= 0
+    },
+    async toggleFollow(manga) {
+      if (!this.searchLibraryId) { this.showError('Select a target library first'); return }
+      const k = manga.externalId + ':fl'
+      this.$set(this.searchBusy, k, true)
+      this.$set(this.searchFollow, manga.externalId, null)
+      try {
+        const url = `https://mangadex.org/title/${manga.externalId}`
+        const uuidLower = String(manga.externalId || '').toLowerCase()
+        const wantUnfollow = this.isFollowed(manga)
+        if (wantUnfollow) {
+          // Find which library contains the URL and remove the line there.
+          const lineRe = new RegExp(`^\\s*https?:\\/\\/mangadex\\.org\\/title\\/${uuidLower}(?:[\\/?#].*)?\\s*$`, 'i')
+          let removedAnywhere = false
+          for (const lib of this.libraries) {
+            const current = await this.$http.get(`/api/v1/downloads/follow-txt/${lib.id}`)
+            const existing = (current.data && current.data.content) || ''
+            const lines = existing.split(/\r?\n/)
+            const kept = lines.filter(l => !lineRe.test(l))
+            if (kept.length !== lines.length) {
+              const next = kept.join('\n').replace(/\n+$/, '') + (kept.some(l => l.trim()) ? '\n' : '')
+              await this.$http.put(`/api/v1/downloads/follow-txt/${lib.id}`, { content: next })
+              removedAnywhere = true
+            }
+          }
+          if (removedAnywhere) {
+            this.followedUuids = this.followedUuids.filter(u => u !== uuidLower)
+            this.showSuccess(`Removed from follow.txt: ${manga.title}`)
+          } else {
+            this.showError(`Could not find ${manga.title} in any follow.txt`)
+          }
+        } else {
+          const current = await this.$http.get(`/api/v1/downloads/follow-txt/${this.searchLibraryId}`)
+          const existing = (current.data && current.data.content) || ''
+          const next = existing.trimEnd() + (existing.trim() ? '\n' : '') + url + '\n'
+          await this.$http.put(`/api/v1/downloads/follow-txt/${this.searchLibraryId}`, { content: next })
+          this.followedUuids = this.followedUuids.concat([uuidLower])
+          this.showSuccess(`Added to follow.txt: ${manga.title}`)
+        }
+      } catch (e) {
+        this.$set(this.searchFollow, manga.externalId, 'error')
+        this.showError('Follow toggle failed: ' + (e?.response?.data?.message || e.message))
+      } finally {
+        this.$set(this.searchBusy, k, false)
+      }
+    },
+    loadFilterDefaults() {
+      try {
+        const raw = localStorage.getItem('komga-fork.mangadex-search-defaults')
+        if (!raw) return
+        const v = JSON.parse(raw) || {}
+        this.filterTags = Array.isArray(v.t) ? v.t : []
+        this.filterExcludedTags = Array.isArray(v.x) ? v.x : []
+        this.filterStatus = Array.isArray(v.s) ? v.s : []
+        this.filterRating = Array.isArray(v.r) ? v.r : []
+        this.filterDemographic = Array.isArray(v.d) ? v.d : []
+        this.filterAvailableOnly = !!v.a
+        this.filterHideFollowed = !!v.h
+      } catch (_) {
+        // ignore corrupt local storage
+      }
+      this.savedFiltersHash = this.currentFilterHash
+    },
+    saveFilterDefaults() {
+      try {
+        localStorage.setItem('komga-fork.mangadex-search-defaults', JSON.stringify(this.currentFilterPayload))
+        this.savedFiltersHash = this.currentFilterHash
+        this.showSuccess('Filters saved as default for this browser')
+      } catch (e) {
+        this.showError('Failed to save defaults: ' + e.message)
+      }
+    },
+    clearFilters() {
+      this.filterTags = []
+      this.filterExcludedTags = []
+      this.filterStatus = []
+      this.filterRating = []
+      this.filterDemographic = []
+      this.filterAvailableOnly = false
+      this.filterHideFollowed = false
+    },
+    async fetchPreferredLanguage() {
+      // gallery-dl Downloader's default_language is the closest thing to
+      // "what language do I want?" Default to 'en' if not configured.
+      try {
+        const r = await this.$http.get('/api/v1/plugins/gallery-dl-downloader/config')
+        return (r.data && r.data.default_language) || 'en'
+      } catch (_) {
+        return 'en'
+      }
+    },
+    async loadTagsIfNeeded() {
+      if (this.tagOptions.length > 0 || this.loadingTags) return
+      const cacheKey = 'komga-fork.mangadex-tags-cache'
+      const ttlMs = 7 * 24 * 60 * 60 * 1000
+      try {
+        const raw = localStorage.getItem(cacheKey)
+        if (raw) {
+          const cached = JSON.parse(raw)
+          if (cached && Array.isArray(cached.tags) && (Date.now() - cached.t) < ttlMs) {
+            this.tagOptions = cached.tags
+            return
+          }
+        }
+      } catch (_) { /* ignore */ }
+      this.loadingTags = true
+      try {
+        const r = await this.$http.get('/api/v1/plugins/mangadex-metadata/tags')
+        this.tagOptions = r.data || []
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), tags: this.tagOptions }))
+        } catch (_) { /* ignore */ }
+      } catch (e) {
+        this.showError('Failed to load MangaDex tag list: ' + (e?.response?.data?.message || e.message))
+      } finally {
+        this.loadingTags = false
+      }
+    },
+    async searchMangaDex(resetPage = true) {
+      const q = (this.searchQuery || '').trim()
+      if (!q && !this.hasFilters) return
+      if (resetPage) this.searchPage = 1
+      this.searchLoading = true
+      this.searchDone = false
+      this.searchResults = []
+      this.searchBusy = {}
+      this.searchAction = {}
+      this.searchFollow = {}
+      this.lastSearchSkippedAvailable = 0
+      this.lastSearchSkippedFollow = 0
+      try {
+        const followedPromise = this.refreshFollowedUuids()
+        const offset = (this.searchPage - 1) * this.searchPageSize
+        const resp = await this.$http.post('/api/v1/plugins/mangadex-metadata/search-advanced', {
+          query: q || null,
+          includedTagIds: this.filterTags,
+          excludedTagIds: this.filterExcludedTags,
+          status: this.filterStatus,
+          contentRating: this.filterRating,
+          publicationDemographic: this.filterDemographic,
+          hasAvailableChapters: this.filterAvailableOnly || null,
+          offset,
+          limit: this.searchPageSize,
+        })
+        const page = resp.data || {}
+        let filtered = page.data || []
+        this.searchTotal = page.total || 0
+        await followedPromise
+        if (this.filterHideFollowed && filtered.length > 0) {
+          const before = filtered.length
+          filtered = filtered.filter(r => !this.isFollowed(r))
+          this.lastSearchSkippedFollow = before - filtered.length
+        }
+        if (this.filterAvailableOnly && filtered.length > 0) {
+          const beforeAvail = filtered.length
+          try {
+            const lang = await this.fetchPreferredLanguage()
+            const check = await this.$http.post('/api/v1/plugins/mangadex-metadata/downloadable-check', {
+              language: lang,
+              ids: filtered.map(r => r.externalId),
+            })
+            const map = check.data || {}
+            filtered = filtered.filter(r => map[r.externalId] === true)
+            this.lastSearchSkippedAvailable = beforeAvail - filtered.length
+          } catch (e) {
+            this.showError('Downloadable-check failed: ' + (e?.response?.data?.message || e.message))
+          }
+        }
+        this.searchResults = filtered
+        this.searchDone = true
+      } catch (e) {
+        const msg = e?.response?.data?.message || e.message
+        this.showError('Search failed: ' + msg + ' (is the MangaDex Metadata plugin enabled?)')
+      } finally {
+        this.searchLoading = false
+      }
+    },
+    onSearchPageChange(page) {
+      this.searchPage = page
+      this.searchMangaDex(false)
+    },
+    async downloadFromSearch(manga) {
+      if (!this.searchLibraryId) { this.showError('Select a target library first'); return }
+      const k = manga.externalId + ':dl'
+      this.$set(this.searchBusy, k, true)
+      try {
+        await this.$http.post('/api/v1/downloads', {
+          sourceUrl: `https://mangadex.org/title/${manga.externalId}`,
+          libraryId: this.searchLibraryId,
+          priority: 5,
+        })
+        this.$set(this.searchAction, manga.externalId, 'downloaded')
+        this.showSuccess(`Queued: ${manga.title}`)
+      } catch (e) {
+        this.$set(this.searchAction, manga.externalId, 'error')
+        this.showError('Failed to queue: ' + (e?.response?.data?.message || e.message))
+      } finally {
+        this.$set(this.searchBusy, k, false)
       }
     },
     selectLibrary(index) {
