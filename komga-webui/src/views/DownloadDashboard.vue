@@ -236,6 +236,28 @@
                           class="mt-0"
                         />
                       </v-col>
+                      <v-col cols="12" md="6" class="d-flex align-center">
+                        <v-select
+                          v-model="searchOrder"
+                          :items="sortOptions"
+                          label="Sort by"
+                          dense
+                          hide-details
+                          outlined
+                          class="mt-0 me-2"
+                          @change="onSortChange"
+                        />
+                        <v-select
+                          v-model="searchOrderDir"
+                          :items="[{text: 'Desc', value: 'desc'}, {text: 'Asc', value: 'asc'}]"
+                          label="Direction"
+                          dense
+                          hide-details
+                          outlined
+                          style="max-width:120px"
+                          @change="onSortChange"
+                        />
+                      </v-col>
                       <v-col cols="12" class="d-flex align-center pt-2">
                         <v-btn small text @click="saveFilterDefaults" :color="filtersDirty ? 'primary' : ''">
                           <v-icon small left>mdi-content-save</v-icon>
@@ -246,7 +268,7 @@
                           Clear all
                         </v-btn>
                         <v-spacer />
-                        <span class="caption text--secondary">Defaults are stored per browser (localStorage)</span>
+                        <span class="caption text--secondary">Defaults are stored in your account</span>
                       </v-col>
                     </v-row>
                   </v-expansion-panel-content>
@@ -261,7 +283,7 @@
                   style="min-width:130px;max-width:180px;"
                 >
                   <v-card outlined height="100%" class="d-flex flex-column">
-                    <div class="grey lighten-3 d-flex align-center justify-center" style="width:100%;padding-top:150%;position:relative;">
+                    <div class="grey lighten-3 d-flex align-center justify-center" style="width:100%;padding-top:150%;position:relative;cursor:pointer;" @click="showMangaDetails(manga)" title="Show description">
                       <img
                         v-if="manga.coverUrl"
                         :src="manga.coverUrl"
@@ -272,7 +294,7 @@
                       <v-icon v-else color="grey lighten-1" style="position:absolute;">mdi-book-open-page-variant</v-icon>
                     </div>
                     <v-card-text class="pa-1 flex-grow-1">
-                      <div class="text-caption font-weight-bold" style="line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">{{ manga.title }}</div>
+                      <div class="text-caption font-weight-bold" style="line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer;" @click="showMangaDetails(manga)">{{ manga.title }}</div>
                       <v-chip v-if="manga.status" x-small class="mt-1" :color="statusColor(manga.status)">{{ manga.status }}</v-chip>
                     </v-card-text>
                     <v-card-actions class="pa-1 pt-0 flex-column">
@@ -300,6 +322,49 @@
                   </v-card>
                 </v-col>
               </v-row>
+
+              <v-dialog v-model="detailsDialog" max-width="700" scrollable>
+                <v-card v-if="detailsManga">
+                  <v-card-title class="text-h6" style="word-break:normal;">{{ detailsManga.title }}</v-card-title>
+                  <v-card-text>
+                    <v-row dense>
+                      <v-col cols="12" sm="4">
+                        <img
+                          v-if="detailsManga.coverUrl"
+                          :src="detailsManga.coverUrl"
+                          referrerpolicy="no-referrer"
+                          alt=""
+                          style="width:100%;border-radius:4px;"
+                        />
+                      </v-col>
+                      <v-col cols="12" sm="8">
+                        <div class="mb-2">
+                          <v-chip v-if="detailsManga.status" x-small :color="statusColor(detailsManga.status)" class="me-1">{{ detailsManga.status }}</v-chip>
+                          <v-chip v-if="detailsManga.year" x-small class="me-1">{{ detailsManga.year }}</v-chip>
+                          <span v-if="detailsManga.author" class="text-caption">{{ detailsManga.author }}</span>
+                        </div>
+                        <div v-if="detailsManga.tags && detailsManga.tags.length" class="mb-2">
+                          <v-chip v-for="t in detailsManga.tags" :key="t" x-small outlined class="me-1 mb-1">{{ t }}</v-chip>
+                        </div>
+                        <div class="body-2" style="white-space:pre-line;">{{ detailsManga.description || 'No description available.' }}</div>
+                      </v-col>
+                    </v-row>
+                  </v-card-text>
+                  <v-card-actions>
+                    <v-btn
+                      text
+                      color="primary"
+                      :disabled="!!searchAction[detailsManga.externalId]"
+                      @click="downloadFromSearch(detailsManga)"
+                    >
+                      <v-icon left>mdi-download</v-icon>
+                      {{ searchAction[detailsManga.externalId] === 'downloaded' ? 'Queued' : 'Download' }}
+                    </v-btn>
+                    <v-spacer />
+                    <v-btn text @click="detailsDialog = false">Close</v-btn>
+                  </v-card-actions>
+                </v-card>
+              </v-dialog>
 
               <div v-if="searchDone && searchResults.length === 0 && !searchLoading" class="text-center py-2 text--secondary">
                 No results found{{ lastSearchSkippedNote }}
@@ -817,17 +882,34 @@ export default {
       tagOptions: [],
       loadingTags: false,
       savedFiltersHash: '',
+      FILTER_DEFAULTS_KEY: 'komga.fork.mangadexsearch.defaults',
       lastSearchSkippedAvailable: 0,
       lastSearchSkippedFollow: 0,
       // Pagination
       searchPageSize: 24,
       searchPage: 1,
       searchTotal: 0,
+      searchOrder: '',
+      searchOrderDir: 'desc',
       followedUuids: [],
       followedUuidsLoadError: '',
+      detailsDialog: false,
+      detailsManga: null,
     }
   },
   computed: {
+    sortOptions() {
+      return [
+        {text: 'Relevance', value: ''},
+        {text: 'Popularity', value: 'followedCount'},
+        {text: 'Latest chapter', value: 'latestUploadedChapter'},
+        {text: 'Recently added', value: 'createdAt'},
+        {text: 'Recently updated', value: 'updatedAt'},
+        {text: 'Title', value: 'title'},
+        {text: 'Rating', value: 'rating'},
+        {text: 'Year', value: 'year'},
+      ]
+    },
     currentFilterPayload() {
       return {
         t: [...(this.filterTags || [])].sort(),
@@ -1011,28 +1093,58 @@ export default {
         this.$set(this.searchBusy, k, false)
       }
     },
-    loadFilterDefaults() {
+    showMangaDetails(manga) {
+      this.detailsManga = manga
+      this.detailsDialog = true
+    },
+    onSortChange() {
+      if (this.searchDone || this.searchQuery || this.hasFilters) {
+        this.searchPage = 1
+        this.searchMangaDex()
+      }
+    },
+    async loadFilterDefaults() {
+      let raw = null
       try {
-        const raw = localStorage.getItem('komga-fork.mangadex-search-defaults')
-        if (!raw) return
-        const v = JSON.parse(raw) || {}
-        this.filterTags = Array.isArray(v.t) ? v.t : []
-        this.filterExcludedTags = Array.isArray(v.x) ? v.x : []
-        this.filterStatus = Array.isArray(v.s) ? v.s : []
-        this.filterRating = Array.isArray(v.r) ? v.r : []
-        this.filterDemographic = Array.isArray(v.d) ? v.d : []
-        this.filterAvailableOnly = !!v.a
-        this.filterHideFollowed = !!v.h
+        const settings = await this.$komgaSettings.getClientSettingsUser()
+        const entry = settings && settings[this.FILTER_DEFAULTS_KEY]
+        if (entry && entry.value) raw = entry.value
       } catch (_) {
-        // ignore corrupt local storage
+        // account settings unavailable — fall through to localStorage migration
+      }
+      // Migration: pick up a value previously saved in this browser's localStorage
+      if (!raw) {
+        try {
+          raw = localStorage.getItem('komga-fork.mangadex-search-defaults')
+        } catch (_) { /* ignore */ }
+      }
+      if (raw) {
+        try {
+          const v = JSON.parse(raw) || {}
+          this.filterTags = Array.isArray(v.t) ? v.t : []
+          this.filterExcludedTags = Array.isArray(v.x) ? v.x : []
+          this.filterStatus = Array.isArray(v.s) ? v.s : []
+          this.filterRating = Array.isArray(v.r) ? v.r : []
+          this.filterDemographic = Array.isArray(v.d) ? v.d : []
+          this.filterAvailableOnly = !!v.a
+          this.filterHideFollowed = !!v.h
+        } catch (_) {
+          // ignore corrupt value
+        }
       }
       this.savedFiltersHash = this.currentFilterHash
     },
-    saveFilterDefaults() {
+    async saveFilterDefaults() {
       try {
-        localStorage.setItem('komga-fork.mangadex-search-defaults', JSON.stringify(this.currentFilterPayload))
+        await this.$komgaSettings.updateClientSettingUser({
+          [this.FILTER_DEFAULTS_KEY]: { value: JSON.stringify(this.currentFilterPayload) },
+        })
         this.savedFiltersHash = this.currentFilterHash
-        this.showSuccess('Filters saved as default for this browser')
+        // Drop any stale per-browser copy now that it lives in the account
+        try {
+          localStorage.removeItem('komga-fork.mangadex-search-defaults')
+        } catch (_) { /* ignore */ }
+        this.showSuccess('Filters saved as default for your account')
       } catch (e) {
         this.showError('Failed to save defaults: ' + e.message)
       }
@@ -1108,6 +1220,8 @@ export default {
           hasAvailableChapters: this.filterAvailableOnly || null,
           offset,
           limit: this.searchPageSize,
+          order: this.searchOrder || null,
+          orderDir: this.searchOrderDir || null,
         })
         const page = resp.data || {}
         let filtered = page.data || []
@@ -1204,7 +1318,7 @@ export default {
       this.checkingNow = true
       try {
         await this.$http.post(`/api/v1/downloads/follow-txt/${this.selectedLibrary.id}/check-now`)
-        this.showSuccess('Scan gestartet — neue Kapitel erscheinen automatisch.')
+        this.showSuccess('Scan started — new chapters will appear automatically.')
       } catch (error) {
         this.showError('Failed to trigger check: ' + error.message)
       } finally {

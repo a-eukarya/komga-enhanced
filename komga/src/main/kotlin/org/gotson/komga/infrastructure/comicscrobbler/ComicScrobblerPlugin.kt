@@ -1,11 +1,9 @@
 package org.gotson.komga.infrastructure.comicscrobbler
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.github.f4b6a3.tsid.TsidCreator
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.gotson.komga.domain.model.DomainEvent
 import org.gotson.komga.domain.model.LogLevel
-import org.gotson.komga.domain.model.PluginLog
 import org.gotson.komga.domain.model.WebLink
 import org.gotson.komga.domain.persistence.BookMetadataRepository
 import org.gotson.komga.domain.persistence.BookRepository
@@ -22,7 +20,6 @@ import org.springframework.stereotype.Component
 import org.springframework.web.client.RestClientException
 import java.net.URLEncoder
 import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -249,13 +246,13 @@ class ComicScrobblerPlugin(
   ): Boolean =
     try {
       waitForMetronSlot()
-      val now = LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+      val today = LocalDateTime.now().toLocalDate().toString()
       metronClient
         .post()
         .uri("/api/collection/scrobble/")
         .header("Authorization", basicAuth(username, password))
         .contentType(MediaType.APPLICATION_JSON)
-        .body(mapOf("issue_id" to issueId, "date_read" to now))
+        .body(mapOf("issue_id" to issueId, "date_read" to today))
         .retrieve()
         .body(String::class.java)
       log(LogLevel.INFO, "Metron: scrobbled '$seriesTitle' issue #$issueId")
@@ -304,18 +301,12 @@ class ComicScrobblerPlugin(
     message: String,
     throwable: Throwable? = null,
   ) {
-    try {
-      pluginLogRepository.insert(
-        PluginLog(
-          id = TsidCreator.getTsid256().toString(),
-          pluginId = pluginId,
-          logLevel = level,
-          message = message,
-          exceptionTrace = throwable?.stackTraceToString(),
-        ),
-      )
-    } catch (e: Exception) {
-      logger.warn(e) { "Failed to write plugin log: $message" }
+    val line = "[$pluginId] $message"
+    when (level) {
+      LogLevel.ERROR -> logger.error(throwable) { line }
+      LogLevel.WARN -> logger.warn(throwable) { line }
+      LogLevel.DEBUG -> logger.debug(throwable) { line }
+      else -> logger.info(throwable) { line }
     }
   }
 }

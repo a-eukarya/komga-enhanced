@@ -7,6 +7,7 @@ import org.gotson.komga.domain.model.Series
 import org.gotson.komga.domain.persistence.PluginConfigRepository
 import org.gotson.komga.domain.persistence.SeriesMetadataRepository
 import org.springframework.stereotype.Service
+import java.nio.file.Files
 
 private val logger = KotlinLogging.logger {}
 
@@ -60,8 +61,11 @@ class AutoMetadataApplier(
 
     val meta = seriesMetadataRepository.findById(series.id)
 
-    if (!force && meta.links.isNotEmpty()) {
-      logger.debug { "Auto-match: series='${series.name}' already has ${meta.links.size} link(s), skipping (use force=true to override)" }
+    // TrackerLinkEnricher adds links independently, so existing links don't imply the
+    // full metadata was written — also require series.json to be present before skipping.
+    val seriesJsonExists = Files.exists(series.path.resolve("series.json"))
+    if (!force && seriesJsonExists && meta.links.isNotEmpty()) {
+      logger.debug { "Auto-match: series='${series.name}' already linked and series.json present, skipping (use force=true to override)" }
       return ApplyOutcome(matched = false, skippedReason = "already-linked")
     }
 

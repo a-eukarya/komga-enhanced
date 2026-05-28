@@ -7,6 +7,7 @@ export interface PageHashDto {
 }
 
 export interface PageHashUnknownDto extends PageHashDto {
+  seriesTitle?: string,
 }
 
 export interface PageHashMatchDto {

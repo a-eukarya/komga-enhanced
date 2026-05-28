@@ -75,13 +75,23 @@
                     <span>{{ $t('plugin_manager.view_logs') }}</span>
                   </v-tooltip>
 
-                  <v-tooltip bottom>
+                  <v-tooltip v-if="item.external" bottom>
                     <template v-slot:activator="{ on }">
                       <v-btn icon small v-on="on" @click="confirmUninstall(item)" color="error">
                         <v-icon small>mdi-delete</v-icon>
                       </v-btn>
                     </template>
                     <span>{{ $t('plugin_manager.uninstall') }}</span>
+                  </v-tooltip>
+                  <v-tooltip v-else bottom>
+                    <template v-slot:activator="{ on }">
+                      <span v-on="on">
+                        <v-btn icon small disabled>
+                          <v-icon small>mdi-lock</v-icon>
+                        </v-btn>
+                      </span>
+                    </template>
+                    <span>{{ $t('plugin_manager.builtin_locked') }}</span>
                   </v-tooltip>
                 </template>
               </v-data-table>
@@ -155,7 +165,64 @@
           </v-alert>
 
           <v-form ref="configForm">
-            <template v-for="key in configKeys">
+            <template v-if="isAutoMetadata">
+              <div class="subtitle-2 font-weight-bold mb-1">{{ $t('plugin_manager.am_provider_priority') }}</div>
+              <div class="caption text--secondary mb-2">{{ getSchemaField('provider_priority').description }}</div>
+              <v-list dense outlined rounded class="mb-2">
+                <v-list-item v-if="providerPriorityList.length === 0">
+                  <v-list-item-content class="caption text--secondary">{{ $t('plugin_manager.am_no_providers') }}</v-list-item-content>
+                </v-list-item>
+                <v-list-item v-for="(p, i) in providerPriorityList" :key="p">
+                  <v-avatar size="24" color="grey lighten-2" class="me-3 justify-center">
+                    <span class="caption font-weight-medium">{{ i + 1 }}</span>
+                  </v-avatar>
+                  <v-list-item-content>{{ providerLabel(p) }}</v-list-item-content>
+                  <v-list-item-action class="flex-row align-center ma-0">
+                    <v-btn icon small :disabled="i === 0" @click="moveProvider(i, -1)">
+                      <v-icon small>mdi-arrow-up</v-icon>
+                    </v-btn>
+                    <v-btn icon small :disabled="i === providerPriorityList.length - 1" @click="moveProvider(i, 1)">
+                      <v-icon small>mdi-arrow-down</v-icon>
+                    </v-btn>
+                    <v-btn icon small @click="removeProvider(i)">
+                      <v-icon small color="error">mdi-close</v-icon>
+                    </v-btn>
+                  </v-list-item-action>
+                </v-list-item>
+              </v-list>
+              <v-select
+                v-if="availableProvidersToAdd.length"
+                v-model="providerToAdd"
+                :items="availableProvidersToAdd"
+                item-text="name"
+                item-value="id"
+                :label="$t('plugin_manager.am_add_provider')"
+                outlined
+                dense
+                hide-details
+                class="mb-4"
+                @change="addProvider"
+              ></v-select>
+
+              <v-select
+                v-model="excludedLibraryIdsList"
+                :items="autoLibraries"
+                item-text="name"
+                item-value="id"
+                :label="getSchemaField('exclude_library_ids').title || 'Excluded libraries'"
+                :hint="getSchemaField('exclude_library_ids').description"
+                persistent-hint
+                multiple
+                chips
+                small-chips
+                deletable-chips
+                outlined
+                dense
+                class="mb-4"
+              ></v-select>
+            </template>
+
+            <template v-for="key in genericConfigKeys">
               <v-select
                 v-if="getSchemaField(key).enum || getSchemaField(key).dynamicEnum"
                 :key="key"
@@ -300,6 +367,11 @@ export default {
       pluginConfig: {},
       parsedSchema: null,
       savingConfig: false,
+      autoProviders: [],
+      autoLibraries: [],
+      providerPriorityList: [],
+      excludedLibraryIdsList: [],
+      providerToAdd: null,
       pluginLogs: [],
       loadingLogs: false,
       clearingLogs: false,
@@ -329,6 +401,16 @@ export default {
         return Object.keys(this.parsedSchema.properties)
       }
       return Object.keys(this.pluginConfig || {})
+    },
+    isAutoMetadata() {
+      return this.selectedPlugin?.id === 'auto-metadata'
+    },
+    genericConfigKeys() {
+      if (!this.isAutoMetadata) return this.configKeys
+      return this.configKeys.filter(k => k !== 'provider_priority' && k !== 'exclude_library_ids')
+    },
+    availableProvidersToAdd() {
+      return this.autoProviders.filter(p => !this.providerPriorityList.includes(p.id))
     },
   },
   mounted() {
@@ -365,12 +447,26 @@ export default {
       }
     },
     async installPlugin() {
+      if (!this.pluginFile && !this.pluginUrl) {
+        this.showError(this.$t('plugin_manager.snack_install_failed') + ': ' + this.$t('download_manager.cancel'))
+        return
+      }
       this.installing = true
       try {
+        const form = new FormData()
+        if (this.pluginFile) form.append('file', this.pluginFile)
+        if (this.pluginUrl) form.append('url', this.pluginUrl)
+        await this.$http.post('/api/v1/plugins/install', form, {
+          headers: {'Content-Type': 'multipart/form-data'},
+        })
         this.showSuccess(this.$t('plugin_manager.snack_installed'))
         this.installDialog = false
+        this.pluginFile = null
+        this.pluginUrl = ''
+        await this.loadPlugins()
       } catch (error) {
-        this.showError(this.$t('plugin_manager.snack_install_failed') + ': ' + error.message)
+        const msg = error.response?.data?.message || error.message
+        this.showError(this.$t('plugin_manager.snack_install_failed') + ': ' + msg)
       } finally {
         this.installing = false
       }
@@ -417,14 +513,62 @@ export default {
           }
         }
 
+        if (this.isAutoMetadata) await this.loadAutoMatchOptions()
+
         this.configDialog = true
       } catch (error) {
         this.showError(this.$t('plugin_manager.snack_config_load_failed') + ': ' + error.message)
       }
     },
+    async loadAutoMatchOptions() {
+      // built-in + external METADATA plugins become selectable providers (short id, no -metadata suffix)
+      this.autoProviders = this.plugins
+        .filter(p => p.pluginType === 'METADATA' && p.id !== 'auto-metadata')
+        .map(p => ({ id: p.id.replace(/-metadata$/, ''), name: p.name }))
+      try {
+        this.autoLibraries = await this.$komgaLibraries.getLibraries()
+      } catch (e) {
+        this.autoLibraries = []
+      }
+      const priorityCsv = this.pluginConfig.provider_priority || 'anilist,mangadex,kitsu'
+      this.providerPriorityList = priorityCsv
+        .split(',')
+        .map(s => s.trim().toLowerCase().replace(/-metadata$/, ''))
+        .filter(s => s)
+      this.excludedLibraryIdsList = (this.pluginConfig.exclude_library_ids || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s)
+      this.providerToAdd = null
+    },
+    providerLabel(shortId) {
+      const p = this.autoProviders.find(x => x.id === shortId)
+      return p ? p.name : shortId
+    },
+    moveProvider(index, direction) {
+      const target = index + direction
+      if (target < 0 || target >= this.providerPriorityList.length) return
+      const list = this.providerPriorityList.slice()
+      const [item] = list.splice(index, 1)
+      list.splice(target, 0, item)
+      this.providerPriorityList = list
+    },
+    removeProvider(index) {
+      this.providerPriorityList = this.providerPriorityList.filter((_, i) => i !== index)
+    },
+    addProvider(id) {
+      if (id && !this.providerPriorityList.includes(id)) {
+        this.providerPriorityList = this.providerPriorityList.concat([id])
+      }
+      this.$nextTick(() => { this.providerToAdd = null })
+    },
     async saveConfig() {
       this.savingConfig = true
       try {
+        if (this.isAutoMetadata) {
+          this.pluginConfig.provider_priority = this.providerPriorityList.join(',')
+          this.pluginConfig.exclude_library_ids = this.excludedLibraryIdsList.join(',')
+        }
         await this.$http.post(`/api/v1/plugins/${this.selectedPlugin.id}/config`, this.pluginConfig)
         this.showSuccess(this.$t('plugin_manager.snack_config_saved'))
         this.configDialog = false
@@ -514,6 +658,7 @@ export default {
         PROCESSOR: 'purple',
         NOTIFIER: 'pink',
         ANALYZER: 'cyan',
+        SCROBBLER: 'teal',
       }
       return colors[type] || 'grey'
     },

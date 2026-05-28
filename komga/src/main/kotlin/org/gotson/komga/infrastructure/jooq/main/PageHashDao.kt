@@ -34,6 +34,7 @@ class PageHashDao(
   private val b = Tables.BOOK
   private val ph = Tables.PAGE_HASH
   private val pht = Tables.PAGE_HASH_THUMBNAIL
+  private val sd = Tables.SERIES_METADATA
 
   private val sortsKnown =
     mapOf(
@@ -55,6 +56,7 @@ class PageHashDao(
       "url" to b.URL,
       "bookId" to b.ID,
       "pageNumber" to p.NUMBER,
+      "seriesTitle" to DSL.field("seriesTitle"),
     )
 
   override fun findKnown(pageHash: String): PageHashKnown? =
@@ -107,7 +109,12 @@ class PageHashDao(
           p.FILE_SIZE,
           bookCount.`as`("count"),
           (bookCount * p.FILE_SIZE).`as`("totalSize"),
+          DSL.min(sd.TITLE).`as`("seriesTitle"),
         ).from(p)
+        .leftJoin(b)
+        .on(p.BOOK_ID.eq(b.ID))
+        .leftJoin(sd)
+        .on(b.SERIES_ID.eq(sd.SERIES_ID))
         .where(p.FILE_HASH.ne(""))
         .and(
           DSL.notExists(
@@ -127,7 +134,12 @@ class PageHashDao(
         .orderBy(orderBy)
         .apply { if (pageable.isPaged) limit(pageable.pageSize).offset(pageable.offset) }
         .fetch {
-          PageHashUnknown(it.value1(), it.value2(), it.value3())
+          PageHashUnknown(
+            it.value1(),
+            it.value2(),
+            it.value3(),
+            it.get("seriesTitle", String::class.java),
+          )
         }
 
     val pageSort = if (orderBy.isNotEmpty()) pageable.sort else Sort.unsorted()

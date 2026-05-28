@@ -15,10 +15,10 @@ import org.gotson.komga.domain.service.SeriesLifecycle
 import org.gotson.komga.infrastructure.download.MangaDexSubscriptionSyncer
 import org.gotson.komga.infrastructure.image.ImageAnalyzer
 import org.gotson.komga.infrastructure.mediacontainer.ContentDetector
-import org.gotson.komga.infrastructure.metadata.anilist.AniListMetadataPlugin
-import org.gotson.komga.infrastructure.metadata.kitsu.KitsuMetadataPlugin
 import org.gotson.komga.infrastructure.metadata.mangadex.MangaDexMetadataPlugin
 import org.gotson.komga.infrastructure.openapi.OpenApiConfiguration.TagNames
+import org.gotson.komga.infrastructure.plugin.PluginLoadException
+import org.gotson.komga.infrastructure.plugin.PluginRegistry
 import org.gotson.komga.interfaces.api.rest.dto.PluginDto
 import org.gotson.komga.interfaces.api.rest.dto.PluginUpdateDto
 import org.springframework.http.HttpStatus
@@ -35,6 +35,7 @@ import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
 import org.springframework.web.client.RestClient
+import org.springframework.web.multipart.MultipartFile
 import org.springframework.web.server.ResponseStatusException
 import java.io.File
 import java.net.URI
@@ -51,14 +52,13 @@ class PluginController(
   private val pluginConfigRepository: org.gotson.komga.domain.persistence.PluginConfigRepository,
   private val pluginLogRepository: org.gotson.komga.domain.persistence.PluginLogRepository,
   private val mangaDexMetadataPlugin: MangaDexMetadataPlugin,
-  private val aniListMetadataPlugin: AniListMetadataPlugin,
-  private val kitsuMetadataPlugin: KitsuMetadataPlugin,
   private val mangaDexSubscriptionSyncer: MangaDexSubscriptionSyncer,
   private val seriesRepository: SeriesRepository,
   private val seriesLifecycle: SeriesLifecycle,
   private val contentDetector: ContentDetector,
   private val imageAnalyzer: ImageAnalyzer,
   private val objectMapper: ObjectMapper,
+  private val pluginRegistry: PluginRegistry,
 ) {
   private val coverClient = RestClient.create()
 
@@ -67,9 +67,7 @@ class PluginController(
   private fun getMetadataProvider(pluginId: String): OnlineMetadataProvider? =
     when (pluginId) {
       "mangadex-metadata" -> mangaDexMetadataPlugin
-      "anilist-metadata" -> aniListMetadataPlugin
-      "kitsu-metadata" -> kitsuMetadataPlugin
-      else -> null
+      else -> pluginRegistry.metadataProviderFor(pluginId)
     }
 
   @GetMapping
@@ -80,7 +78,7 @@ class PluginController(
     plugins.forEach { p ->
       logger.info { "Plugin: ${p.id}, type=${p.pluginType}, enabled=${p.enabled}" }
     }
-    return plugins.map { it.toDto() }.sortedBy { it.name }
+    return plugins.map { it.toDto(pluginRegistry.isExternal(it.id)) }.sortedBy { it.name }
   }
 
   @GetMapping("{id}")
@@ -88,7 +86,7 @@ class PluginController(
   fun getPluginById(
     @PathVariable id: String,
   ): PluginDto =
-    pluginRepository.findByIdOrNull(id)?.toDto()
+    pluginRepository.findByIdOrNull(id)?.toDto(pluginRegistry.isExternal(id))
       ?: throw ResponseStatusException(HttpStatus.NOT_FOUND, "Plugin not found: $id")
 
   @PatchMapping("{id}")
@@ -122,7 +120,48 @@ class PluginController(
   fun deletePlugin(
     @PathVariable id: String,
   ) {
+    if (!pluginRegistry.isExternal(id)) {
+      throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Built-in plugins cannot be uninstalled")
+    }
+    pluginRegistry.uninstall(id)
     pluginRepository.delete(id)
+  }
+
+  @PostMapping("install", consumes = [MediaType.MULTIPART_FORM_DATA_VALUE])
+  @ResponseStatus(HttpStatus.CREATED)
+  @Operation(summary = "Install an external plugin from a JAR file or URL", tags = [TagNames.PLUGINS])
+  fun installPlugin(
+    @RequestParam(required = false) file: MultipartFile?,
+    @RequestParam(required = false) url: String?,
+  ): PluginDto {
+    val filename: String
+    val bytes: ByteArray
+    if (file != null && !file.isEmpty) {
+      filename = file.originalFilename ?: "plugin.jar"
+      bytes = file.bytes
+    } else if (!url.isNullOrBlank()) {
+      val uri = URI.create(url.trim())
+      if (uri.scheme !in listOf("http", "https")) {
+        throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Only http(s) URLs are supported")
+      }
+      filename = uri.path.substringAfterLast('/').ifBlank { "plugin.jar" }
+      bytes =
+        coverClient
+          .get()
+          .uri(uri)
+          .retrieve()
+          .body(ByteArray::class.java)
+          ?: throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Could not download plugin from $url")
+    } else {
+      throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Provide either a file or a url")
+    }
+
+    return try {
+      pluginRegistry.install(filename, bytes).toDto(true)
+    } catch (e: PluginLoadException) {
+      logger.warn(e) { "Plugin install failed: $filename" }
+      throw ResponseStatusException(HttpStatus.BAD_REQUEST, e.message)
+    }
   }
 
   @GetMapping("{id}/search")
@@ -187,6 +226,8 @@ class PluginController(
       hasAvailableChapters = req.hasAvailableChapters,
       offset = req.offset ?: 0,
       limit = req.limit ?: 24,
+      order = req.order,
+      orderDir = req.orderDir,
     )
   }
 
@@ -365,15 +406,19 @@ class PluginController(
     val providerWebUrl: String? =
       run {
         val ext = request.externalId?.takeIf { it.isNotBlank() } ?: return@run null
-        val explicit = request.provider?.lowercase()
-        when {
-          explicit == "anilist" -> "https://anilist.co/manga/$ext"
-          explicit == "mangadex" -> "https://mangadex.org/title/$ext"
-          explicit == "kitsu" -> "https://kitsu.app/manga/$ext"
-          Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", RegexOption.IGNORE_CASE).matches(ext) ->
-            "https://mangadex.org/title/$ext"
-          ext.all { it.isDigit() } -> "https://anilist.co/manga/$ext"
-          else -> null
+        when (request.provider?.lowercase()?.removeSuffix("-metadata")) {
+          "anilist" -> "https://anilist.co/manga/$ext"
+          "mangadex" -> "https://mangadex.org/title/$ext"
+          "kitsu" -> "https://kitsu.app/manga/$ext"
+          "metron" -> "https://metron.cloud/series/$ext/"
+          // unknown provider: only a MangaDex UUID is unambiguous. Never guess a
+          // numeric id (it could be anilist/kitsu/metron) — a wrong link is worse than none.
+          else ->
+            if (Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", RegexOption.IGNORE_CASE).matches(ext)) {
+              "https://mangadex.org/title/$ext"
+            } else {
+              null
+            }
         }
       }
     providerWebUrl?.let { metadata["web_url"] = it }
@@ -502,6 +547,8 @@ data class MangaDexAdvancedSearchRequest(
   val hasAvailableChapters: Boolean? = null,
   val offset: Int? = null,
   val limit: Int? = null,
+  val order: String? = null,
+  val orderDir: String? = null,
 )
 
 data class PluginApplyAuthor(
@@ -528,7 +575,7 @@ data class PluginApplyMetadataRequest(
   val provider: String? = null,
 )
 
-fun Plugin.toDto() =
+fun Plugin.toDto(external: Boolean = false) =
   PluginDto(
     id = id,
     name = name,
@@ -543,4 +590,5 @@ fun Plugin.toDto() =
     lastUpdated = lastUpdated,
     configSchema = configSchema,
     dependencies = dependencies,
+    external = external,
   )

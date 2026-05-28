@@ -1,66 +1,63 @@
-package org.gotson.komga.infrastructure.metadata.kitsu
+package com.komga.plugins.kitsu
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import io.github.oshai.kotlinlogging.KotlinLogging
-import org.gotson.komga.domain.service.Author
-import org.gotson.komga.domain.service.MetadataDetails
-import org.gotson.komga.domain.service.MetadataSearchResult
-import org.gotson.komga.domain.service.OnlineMetadataProvider
-import org.springframework.stereotype.Service
-import org.springframework.web.client.RestClient
-import org.springframework.web.client.RestClientException
+import org.gotson.komga.infrastructure.plugin.api.MetadataProviderPlugin
+import org.gotson.komga.infrastructure.plugin.api.PluginAuthor
+import org.gotson.komga.infrastructure.plugin.api.PluginContext
+import org.gotson.komga.infrastructure.plugin.api.PluginMetadataDetails
+import org.gotson.komga.infrastructure.plugin.api.PluginSearchResult
+import java.net.URI
+import java.net.URLEncoder
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
 
-private val logger = KotlinLogging.logger {}
+/**
+ * External, dynamically-loaded Kitsu metadata provider. Ported from the former
+ * built-in plugin to exercise the runtime plugin-loading pipeline. Uses the JDK
+ * HTTP client + Jackson (provided by Komga's class loader at runtime).
+ */
+class KitsuMetadataPlugin : MetadataProviderPlugin {
+  override val id = "kitsu-metadata"
+  override val name = "Kitsu"
+  override val version = "1.0.0"
+  override val author = "Kasch_X"
+  override val description = "Fetches manga metadata from kitsu.app. Loaded as an external plugin."
 
-@Service
-class KitsuMetadataPlugin(
-  private val objectMapper: ObjectMapper,
-) : OnlineMetadataProvider {
-  private val restClient = RestClient.create("https://kitsu.app/api/edge")
+  private val baseUrl = "https://kitsu.app/api/edge"
+  private val httpClient = HttpClient.newHttpClient()
+  private val mapper = ObjectMapper()
 
-  override fun search(query: String): List<MetadataSearchResult> {
+  private var context: PluginContext? = null
+
+  override fun initialize(context: PluginContext) {
+    this.context = context
+  }
+
+  override fun search(query: String): List<PluginSearchResult> {
     return try {
-      logger.info { "Searching Kitsu for: $query" }
+      val url =
+        "$baseUrl/manga?filter%5Btext%5D=${enc(query)}" +
+          "&page%5Blimit%5D=20" +
+          "&fields%5Bmanga%5D=${enc("titles,canonicalTitle,synopsis,posterImage,startDate,status,subtype,genres")}" +
+          "&include=genres"
+      val response = fetch(url) ?: return emptyList()
 
-      val response =
-        restClient
-          .get()
-          .uri { uriBuilder ->
-            uriBuilder
-              .path("/manga")
-              .queryParam("filter[text]", query)
-              .queryParam("page[limit]", 20)
-              .queryParam("fields[manga]", "titles,canonicalTitle,synopsis,posterImage,startDate,status,subtype,genres")
-              .queryParam("include", "genres")
-              .build()
-          }.header("Accept", "application/vnd.api+json")
-          .retrieve()
-          .body(String::class.java)
-
-      if (response == null) return emptyList()
-
-      val json = objectMapper.readTree(response)
+      val json = mapper.readTree(response)
       val data = json.get("data") ?: return emptyList()
       if (!data.isArray) return emptyList()
 
       val includedGenres = parseIncludedGenres(json.get("included"))
 
       data.mapNotNull { item ->
-        val id = item.get("id")?.asText() ?: return@mapNotNull null
+        val externalId = item.get("id")?.asText() ?: return@mapNotNull null
         val attrs = item.get("attributes") ?: return@mapNotNull null
 
         val title = attrs.get("canonicalTitle")?.asText() ?: return@mapNotNull null
         val synopsis = attrs.get("synopsis")?.asText()
-        val posterImage =
-          attrs
-            .get("posterImage")
-            ?.get("large")
-            ?.asText()
-            ?: attrs
-              .get("posterImage")
-              ?.get("medium")
-              ?.asText()
+        val posterImage = posterImageOf(attrs)
         val year =
           attrs
             .get("startDate")
@@ -77,8 +74,8 @@ class KitsuMetadataPlugin(
             emptyList()
           }
 
-        MetadataSearchResult(
-          externalId = id,
+        PluginSearchResult(
+          externalId = externalId,
           title = title,
           description = synopsis,
           coverUrl = posterImage,
@@ -86,37 +83,20 @@ class KitsuMetadataPlugin(
           year = year,
           status = status,
           tags = genres,
-          provider = "Kitsu",
         )
       }
-    } catch (e: RestClientException) {
-      logger.error(e) { "Error searching Kitsu" }
-      emptyList()
     } catch (e: Exception) {
-      logger.error(e) { "Unexpected error searching Kitsu" }
+      context?.error("Error searching Kitsu for '$query'", e)
       emptyList()
     }
   }
 
-  override fun getMetadata(externalId: String): MetadataDetails? {
+  override fun getMetadata(externalId: String): PluginMetadataDetails? {
     return try {
-      logger.info { "Fetching Kitsu metadata for ID: $externalId" }
+      val url = "$baseUrl/manga/${enc(externalId)}?include=${enc("genres,staff,staff.person")}"
+      val response = fetch(url) ?: return null
 
-      val response =
-        restClient
-          .get()
-          .uri { uriBuilder ->
-            uriBuilder
-              .path("/manga/$externalId")
-              .queryParam("include", "genres,staff,staff.person")
-              .build()
-          }.header("Accept", "application/vnd.api+json")
-          .retrieve()
-          .body(String::class.java)
-
-      if (response == null) return null
-
-      val json = objectMapper.readTree(response)
+      val json = mapper.readTree(response)
       val attrs = json.get("data")?.get("attributes") ?: return null
 
       val canonicalTitle = attrs.get("canonicalTitle")?.asText() ?: "Unknown"
@@ -124,18 +104,9 @@ class KitsuMetadataPlugin(
       val alternativeTitles = extractAlternativeTitles(titlesNode, canonicalTitle)
 
       val synopsis = attrs.get("synopsis")?.asText()
-      val posterImage =
-        attrs
-          .get("posterImage")
-          ?.get("large")
-          ?.asText()
-          ?: attrs
-            .get("posterImage")
-            ?.get("medium")
-            ?.asText()
+      val posterImage = posterImageOf(attrs)
       val status = mapKitsuStatus(attrs.get("status")?.asText())
       val ageRating = mapKitsuAgeRating(attrs.get("ageRating")?.asText())
-
       val startDate = attrs.get("startDate")?.asText()
 
       val included = json.get("included")
@@ -144,7 +115,7 @@ class KitsuMetadataPlugin(
 
       val titleSort = titlesNode?.get("en_jp")?.asText() ?: canonicalTitle
 
-      MetadataDetails(
+      PluginMetadataDetails(
         title = canonicalTitle,
         titleSort = titleSort,
         summary = synopsis,
@@ -159,23 +130,44 @@ class KitsuMetadataPlugin(
         coverUrl = posterImage,
         alternativeTitles = alternativeTitles,
       )
-    } catch (e: RestClientException) {
-      logger.error(e) { "Error fetching Kitsu metadata" }
-      null
     } catch (e: Exception) {
-      logger.error(e) { "Unexpected error fetching Kitsu metadata" }
+      context?.error("Error fetching Kitsu metadata for '$externalId'", e)
       null
     }
   }
+
+  private fun enc(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8)
+
+  private fun fetch(url: String): String? {
+    val request =
+      HttpRequest
+        .newBuilder()
+        .uri(URI.create(url))
+        .header("Accept", "application/vnd.api+json")
+        .GET()
+        .build()
+    val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+    return if (response.statusCode() in 200..299) response.body() else null
+  }
+
+  private fun posterImageOf(attrs: JsonNode): String? =
+    attrs
+      .get("posterImage")
+      ?.get("large")
+      ?.asText()
+      ?: attrs
+        .get("posterImage")
+        ?.get("medium")
+        ?.asText()
 
   private fun parseIncludedGenres(included: JsonNode?): Map<String, String> {
     if (included == null || !included.isArray) return emptyMap()
     val genres = mutableMapOf<String, String>()
     for (item in included) {
       if (item.get("type")?.asText() == "genres") {
-        val id = item.get("id")?.asText() ?: continue
-        val name = item.get("attributes")?.get("name")?.asText() ?: continue
-        genres[id] = name
+        val genreId = item.get("id")?.asText() ?: continue
+        val genreName = item.get("attributes")?.get("name")?.asText() ?: continue
+        genres[genreId] = genreName
       }
     }
     return genres
@@ -207,19 +199,19 @@ class KitsuMetadataPlugin(
     return alternativeTitles
   }
 
-  private fun extractAuthors(included: JsonNode?): List<Author> {
+  private fun extractAuthors(included: JsonNode?): List<PluginAuthor> {
     if (included == null || !included.isArray) return emptyList()
 
     val people = mutableMapOf<String, String>()
     for (item in included) {
       if (item.get("type")?.asText() == "people") {
-        val id = item.get("id")?.asText() ?: continue
-        val name = item.get("attributes")?.get("name")?.asText() ?: continue
-        people[id] = name
+        val personId = item.get("id")?.asText() ?: continue
+        val personName = item.get("attributes")?.get("name")?.asText() ?: continue
+        people[personId] = personName
       }
     }
 
-    val authors = mutableListOf<Author>()
+    val authors = mutableListOf<PluginAuthor>()
     for (item in included) {
       if (item.get("type")?.asText() == "mediaStaff") {
         val role = item.get("attributes")?.get("role")?.asText() ?: continue
@@ -231,8 +223,8 @@ class KitsuMetadataPlugin(
             ?.get("id")
             ?.asText()
             ?: continue
-        val name = people[personId] ?: continue
-        authors.add(Author(name, role))
+        val personName = people[personId] ?: continue
+        authors.add(PluginAuthor(personName, role))
       }
     }
     return authors

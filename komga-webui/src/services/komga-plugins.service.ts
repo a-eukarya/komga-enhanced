@@ -110,7 +110,7 @@ export default class KomgaPluginsService {
     }
   }
 
-  async applyMetadataToSeries(seriesId: string, metadata: MetadataDetails, externalId?: string): Promise<void> {
+  async applyMetadataToSeries(seriesId: string, metadata: MetadataDetails, externalId?: string, provider?: string): Promise<void> {
     try {
       await this.http.post(`/api/v1/plugins/apply-metadata/${seriesId}`, {
         title: metadata.title,
@@ -120,6 +120,7 @@ export default class KomgaPluginsService {
         releaseDate: metadata.releaseDate,
         status: metadata.status,
         externalId: externalId,
+        provider: provider,
         genres: metadata.genres,
         tags: metadata.tags,
         authors: metadata.authors,

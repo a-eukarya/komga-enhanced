@@ -22,7 +22,7 @@
         <v-checkbox
           v-model="form.guestAccess"
           @change="$v.form.guestAccess.$touch()"
-          label="Guest Mode — Lesezugriff ohne Login erlauben"
+          label="Guest Mode — allow read-only access without login"
           hide-details
         >
           <template v-slot:append>
@@ -44,7 +44,7 @@
           :items="availableLibraries"
           item-text="name"
           item-value="id"
-          label="Bibliotheken für Gäste"
+          label="Libraries for guests"
           multiple
           chips
           small-chips
@@ -58,7 +58,7 @@
                 <v-icon>{{ allLibrariesSelected ? 'mdi-checkbox-marked' : 'mdi-checkbox-blank-outline' }}</v-icon>
               </v-list-item-action>
               <v-list-item-content>
-                <v-list-item-title>Alle Bibliotheken</v-list-item-title>
+                <v-list-item-title>All libraries</v-list-item-title>
               </v-list-item-content>
             </v-list-item>
             <v-divider/>

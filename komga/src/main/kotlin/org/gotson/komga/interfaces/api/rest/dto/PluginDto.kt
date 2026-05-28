@@ -16,6 +16,7 @@ data class PluginDto(
   val lastUpdated: LocalDateTime,
   val configSchema: String?,
   val dependencies: String?,
+  val external: Boolean = false,
 )
 
 data class PluginUpdateDto(

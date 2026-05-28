@@ -55,12 +55,15 @@
               <v-btn
                 color="warning"
                 :loading="fixComicInfo.running"
-                :disabled="!fixComicInfo.libraryId"
+                :disabled="!fixComicInfo.libraryId || fixComicInfo.running"
                 @click="runComicInfoFix"
               >
                 <v-icon left>mdi-play</v-icon>
                 Run
               </v-btn>
+              <span v-if="fixComicInfo.running" class="caption text--secondary ml-3">
+                Running in background — you can leave this page and come back.
+              </span>
             </v-card-actions>
 
             <v-expand-transition>
@@ -108,6 +111,7 @@ export default {
         running: false,
         result: null,
       },
+      polling: false,
       snackbar: {
         show: false,
         text: '',
@@ -121,6 +125,10 @@ export default {
     } catch (e) {
       this.showSnack('Failed to load libraries: ' + (e.message || e), 'error')
     }
+    await this.refreshRepairStatus()
+  },
+  beforeDestroy() {
+    this.polling = false
   },
   methods: {
     async runComicInfoFix() {
@@ -129,32 +137,59 @@ export default {
       try {
         const params = this.fixComicInfo.force ? '?force=true' : ''
         await this.$http.post(`/api/v1/downloads/repair-comicinfo/${this.fixComicInfo.libraryId}${params}`)
-        await this.pollRepairStatus()
+        this.startPolling()
       } catch (e) {
         this.showSnack('Fix failed: ' + (e?.response?.data?.message || e.message || 'Unknown error'), 'error')
         this.fixComicInfo.running = false
       }
     },
+    async refreshRepairStatus() {
+      try {
+        const r = await this.$http.get('/api/v1/downloads/repair-comicinfo/status')
+        const s = r.data
+        this.applyStatus(s)
+        if (s.running) {
+          if (s.libraryId) this.fixComicInfo.libraryId = s.libraryId
+          this.fixComicInfo.running = true
+          this.startPolling()
+        }
+      } catch (e) {
+        // status not available on mount — ignore silently
+      }
+    },
+    startPolling() {
+      if (this.polling) return
+      this.polling = true
+      this.pollRepairStatus()
+    },
     async pollRepairStatus() {
-      while (true) {
+      while (this.polling) {
         await new Promise(r => setTimeout(r, 2000))
+        if (!this.polling) return
         try {
           const r = await this.$http.get('/api/v1/downloads/repair-comicinfo/status')
           const s = r.data
-          this.fixComicInfo.result = {
-            repaired: s.repaired,
-            skipped: s.skipped,
-            mangaProcessed: `${s.processed} / ${s.total}`,
-            errors: s.errors,
-          }
+          this.applyStatus(s)
           if (!s.running) {
             this.fixComicInfo.running = false
+            this.polling = false
             return
           }
         } catch (e) {
           this.showSnack('Status poll failed: ' + (e?.response?.data?.message || e.message || 'Unknown error'), 'error')
           this.fixComicInfo.running = false
+          this.polling = false
           return
+        }
+      }
+    },
+    applyStatus(s) {
+      if (s.running || s.finishedAt || s.total > 0 || s.processed > 0) {
+        this.fixComicInfo.result = {
+          repaired: s.repaired,
+          skipped: s.skipped,
+          mangaProcessed: `${s.processed} / ${s.total}`,
+          errors: s.errors,
         }
       }
     },

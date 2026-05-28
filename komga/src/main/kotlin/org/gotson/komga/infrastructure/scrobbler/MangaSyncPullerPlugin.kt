@@ -1,10 +1,8 @@
 package org.gotson.komga.infrastructure.scrobbler
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.github.f4b6a3.tsid.TsidCreator
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.gotson.komga.domain.model.LogLevel
-import org.gotson.komga.domain.model.PluginLog
 import org.gotson.komga.domain.model.ReadProgress
 import org.gotson.komga.domain.model.SyncState
 import org.gotson.komga.domain.persistence.BookMetadataRepository
@@ -283,18 +281,12 @@ class MangaSyncPullerPlugin(
     message: String,
     throwable: Throwable? = null,
   ) {
-    try {
-      pluginLogRepository.insert(
-        PluginLog(
-          id = TsidCreator.getTsid256().toString(),
-          pluginId = pluginId,
-          logLevel = level,
-          message = message,
-          exceptionTrace = throwable?.stackTraceToString(),
-        ),
-      )
-    } catch (e: Exception) {
-      logger.warn(e) { "Failed to write plugin log: $message" }
+    val line = "[$pluginId] $message"
+    when (level) {
+      LogLevel.ERROR -> logger.error(throwable) { line }
+      LogLevel.WARN -> logger.warn(throwable) { line }
+      LogLevel.DEBUG -> logger.debug(throwable) { line }
+      else -> logger.info(throwable) { line }
     }
   }
 }

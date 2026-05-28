@@ -26,7 +26,7 @@ class PluginInitializer(
           id = "gallery-dl-downloader",
           name = "gallery-dl Downloader",
           version = "1.0.0",
-          author = "Komga Team",
+          author = "Kasch_X",
           description = "Downloads manga from 1000+ websites using gallery-dl integration. Requires gallery-dl to be installed (pip install gallery-dl). Supports automatic chapter tracking via --download-archive and ComicInfo.xml generation.",
           enabled = true,
           pluginType = PluginType.DOWNLOAD,
@@ -89,9 +89,9 @@ class PluginInitializer(
         ),
         Plugin(
           id = "mangadex-metadata",
-          name = "MangaDex Metadata Provider",
+          name = "MangaDex",
           version = "1.0.0",
-          author = "Komga Team",
+          author = "Kasch_X",
           description = "Fetches manga metadata from MangaDex API v5",
           enabled = true,
           pluginType = PluginType.METADATA,
@@ -103,77 +103,13 @@ class PluginInitializer(
           dependencies = null,
         ),
         Plugin(
-          id = "anilist-metadata",
-          name = "AniList Metadata Provider",
-          version = "1.0.0",
-          author = "Komga Team",
-          description = "Fetches manga and anime metadata from AniList GraphQL API",
-          enabled = true,
-          pluginType = PluginType.METADATA,
-          entryPoint = "org.gotson.komga.infrastructure.metadata.anilist.AniListMetadataPlugin",
-          sourceUrl = "https://anilist.co",
-          installedDate = LocalDateTime.now(),
-          lastUpdated = LocalDateTime.now(),
-          configSchema = null,
-          dependencies = null,
-        ),
-        Plugin(
-          id = "kitsu-metadata",
-          name = "Kitsu Metadata Provider",
-          version = "1.0.0",
-          author = "Komga Team",
-          description = "Fetches manga metadata from the Kitsu API (kitsu.app). Provides series-level metadata including titles, synopsis, genres, authors, age rating, and alternative titles.",
-          enabled = true,
-          pluginType = PluginType.METADATA,
-          entryPoint = "org.gotson.komga.infrastructure.metadata.kitsu.KitsuMetadataPlugin",
-          sourceUrl = "https://kitsu.app",
-          installedDate = LocalDateTime.now(),
-          lastUpdated = LocalDateTime.now(),
-          configSchema = null,
-          dependencies = null,
-        ),
-        Plugin(
-          id = "metron-metadata",
-          name = "Metron Metadata Provider",
-          version = PluginVersions.METRON_METADATA,
-          author = "Jack O'Hagan",
-          description = "Fetches comic series metadata from Metron (metron.cloud) API. Requires a free Metron account for API authentication. Configures series metadata including title, publisher, description, genres, and cover art.",
-          enabled = false,
-          pluginType = PluginType.METADATA,
-          entryPoint = "org.gotson.komga.infrastructure.metadata.metron.MetronMetadataPlugin",
-          sourceUrl = "https://metron.cloud",
-          installedDate = LocalDateTime.now(),
-          lastUpdated = LocalDateTime.now(),
-          configSchema =
-            """
-            {
-              "type": "object",
-              "properties": {
-                "metron_username": {
-                  "type": "string",
-                  "title": "Metron Username",
-                  "description": "Your Metron account username (metron.cloud)"
-                },
-                "metron_password": {
-                  "type": "string",
-                  "title": "Metron Password",
-                  "format": "password",
-                  "description": "Your Metron account password"
-                }
-              },
-              "required": ["metron_username", "metron_password"]
-            }
-            """.trimIndent(),
-          dependencies = null,
-        ),
-        Plugin(
           id = "manga-scrobbler",
           name = "Manga Scrobbler (AniList / MyAnimeList / Kitsu / MangaDex)",
           version = PluginVersions.MANGA_SCROBBLER,
           author = "Jack O'Hagan",
           description = "Syncs read progress to AniList, MyAnimeList, Kitsu, and/or MangaDex when a book is marked completed. Supports auto-refresh for expiring MAL/Kitsu OAuth2 tokens. Resolves tracker IDs from SeriesMetadata links (anilist.co / myanimelist.net / kitsu.app / mangadex.org) or via manual JSON mappings.",
           enabled = false,
-          pluginType = PluginType.NOTIFIER,
+          pluginType = PluginType.SCROBBLER,
           entryPoint = "org.gotson.komga.infrastructure.scrobbler.MangaScrobblerPlugin",
           sourceUrl = null,
           installedDate = LocalDateTime.now(),
@@ -298,7 +234,7 @@ class PluginInitializer(
           author = "Jack O'Hagan",
           description = "Syncs comic read progress to Metron (metron.cloud) when a book is marked completed. Resolves issue IDs from series links (metron.cloud/issue/... or metron.cloud/series/... from Metron Metadata Provider), auto-search by series name, or via manual JSON mappings.",
           enabled = false,
-          pluginType = PluginType.NOTIFIER,
+          pluginType = PluginType.SCROBBLER,
           entryPoint = "org.gotson.komga.infrastructure.comicscrobbler.ComicScrobblerPlugin",
           sourceUrl = "https://metron.cloud",
           installedDate = LocalDateTime.now(),
@@ -404,10 +340,10 @@ class PluginInitializer(
           id = "mangadex-subscription",
           name = "MangaDex Subscription Sync",
           version = "1.0.0",
-          author = "Komga Team",
+          author = "Kasch_X",
           description = "Watches your MangaDex follow feed for new chapters and auto-downloads them. Requires a MangaDex personal API client (register at mangadex.org/settings).",
           enabled = false,
-          pluginType = PluginType.DOWNLOAD,
+          pluginType = PluginType.PROCESSOR,
           entryPoint = "org.gotson.komga.infrastructure.download.MangaDexSubscriptionSyncer",
           sourceUrl = "https://api.mangadex.org",
           installedDate = LocalDateTime.now(),
@@ -465,9 +401,23 @@ class PluginInitializer(
         if (existing == null) {
           pluginRepository.insert(plugin)
           logger.info("Installed default plugin: ${plugin.name}")
-        } else if (existing.configSchema != plugin.configSchema) {
-          pluginRepository.update(existing.copy(configSchema = plugin.configSchema))
-          logger.info("Updated configSchema for plugin: ${plugin.name}")
+        } else {
+          // keep built-in metadata in sync with code; preserve the user's enabled flag and install date
+          val synced =
+            existing.copy(
+              name = plugin.name,
+              version = plugin.version,
+              author = plugin.author,
+              description = plugin.description,
+              pluginType = plugin.pluginType,
+              entryPoint = plugin.entryPoint,
+              sourceUrl = plugin.sourceUrl,
+              configSchema = plugin.configSchema,
+            )
+          if (synced != existing) {
+            pluginRepository.update(synced)
+            logger.info("Synced default plugin metadata: ${plugin.name}")
+          }
         }
       } catch (e: Exception) {
         logger.error("Failed to install default plugin: ${plugin.name}", e)

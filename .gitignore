@@ -52,6 +52,7 @@ nbdist/
 
 ### Komga
 /komga/src/main/resources/public/
+/komga/src/main/resources/default-plugins/
 /config-dir/
 application-oauth2.yml
 /benchmark

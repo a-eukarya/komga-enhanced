@@ -20,6 +20,11 @@ plugins {
   jacoco
 }
 
+// all :plugins:* subprojects are bundled as default plugins; ensure they are
+// configured before we reference their `jar` task
+val defaultPluginProjects = rootProject.subprojects.filter { it.path.startsWith(":plugins:") }
+defaultPluginProjects.forEach { evaluationDependsOn(it.path) }
+
 val benchmarkSourceSet =
   sourceSets.create("benchmark") {
     java {
@@ -224,7 +229,16 @@ tasks {
     }
   }
 
+  // bundle dynamically-loaded default plugins (built as separate Gradle modules)
+  // into the app resources; PluginRegistry installs them into the config dir on startup
+  register<Copy>("copyDefaultPlugins") {
+    group = "build"
+    defaultPluginProjects.forEach { from(it.tasks.named("jar")) }
+    into("$projectDir/src/main/resources/default-plugins/")
+  }
+
   withType<ProcessResources> {
+    dependsOn("copyDefaultPlugins")
     filesMatching("application*.yml") {
       expand(project.properties)
     }

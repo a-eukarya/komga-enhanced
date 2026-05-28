@@ -6,6 +6,7 @@ data class PageHashUnknownDto(
   val hash: String,
   val size: Long?,
   val matchCount: Int,
+  val seriesTitle: String?,
 )
 
 fun PageHashUnknown.toDto() =
@@ -13,4 +14,5 @@ fun PageHashUnknown.toDto() =
     hash = hash,
     size = size,
     matchCount = matchCount,
+    seriesTitle = seriesTitle,
   )

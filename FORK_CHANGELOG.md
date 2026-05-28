@@ -22,6 +22,22 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 GUI-triggered one-time maintenance actions live under **Settings → Fixes**. Cards are versioned and removed once no longer needed.
 
 - **Re-inject ComicInfo.xml** — regenerates `ComicInfo.xml` + `series.json` for every CBZ in the selected library from MangaDex metadata. Enable Force to overwrite existing ComicInfo. Useful when MangaDex metadata has changed, when CBZs are missing ComicInfo, or to migrate libraries that ran an older fork build with different ComicInfo layout.
+  - Runs fully in the background: after **Run** the job continues server-side even if you navigate away. Returning to the Fixes page re-attaches to the running job (resumes the progress display) and shows the last finished result when idle.
+
+### New: External plugin loading (install plugin JARs)
+
+Until now the "Install Plugin" dialog in the Plugin Manager was a no-op — plugins could only be the ones compiled into Komga and registered at startup (`PluginInitializer`). The fork now supports **real dynamic plugin JARs** that load at runtime, alongside the built-in plugins. Both coexist: built-ins stay as before, external JARs are an additive extension point.
+
+- **Plugin SPI** (`org.gotson.komga.infrastructure.plugin.api`): a small, stable contract third parties compile against — `KomgaPlugin` (base), `MetadataProviderPlugin` (search + metadata) and `NotifierPlugin` (event hooks), with plain DTOs (`PluginSearchResult`, `PluginMetadataDetails`, `PluginAuthor`, `PluginNotification`) and a `PluginContext` (config map + logging). A plugin declares its implementation class(es) in `META-INF/services/org.gotson.komga.infrastructure.plugin.api.KomgaPlugin` so it is discoverable via `ServiceLoader`.
+- **Isolated class loading** (`PluginLoader`): each JAR is loaded in its own `URLClassLoader` whose parent is Komga's loader (so the plugin sees the SPI + Kotlin stdlib but stays in its own namespace). Loading failures are reported as `PluginLoadException`, never crash startup.
+- **Registry** (`PluginRegistry`): on `ApplicationReadyEvent` it scans `${komga.config-dir}/plugins/*.jar`, loads each, registers it in the existing `plugin` DB table (reusing the stored `enabled` flag so toggles survive a restart), and calls `initialize(context)`. `install()` writes an uploaded JAR to the plugins dir and loads it live; `uninstall()` calls `shutdown()`, closes the class loader, and deletes the JAR.
+- **Metadata bridge**: a loaded `MetadataProviderPlugin` is adapted to the internal `OnlineMetadataProvider`, so external metadata plugins appear in the "Search Online Databases" dialog and work with the existing `{id}/search`, `{id}/metadata/{externalId}` and `apply-metadata` endpoints with no extra wiring.
+- **Notifier hook**: the registry listens for `DomainEvent.DownloadCompleted` / `DownloadFailed` and dispatches a `PluginNotification` (`DOWNLOAD_COMPLETED` / `DOWNLOAD_FAILED`) to every enabled `NotifierPlugin`. Failures in a notifier are logged and never affect the download flow.
+- **Plugin template** (`plugin-template/`) + guide (`PLUGINS.md`): a standalone Gradle project with example metadata + notifier plugins. It mirrors the SPI locally (excluded from the built JAR) so authors only write their code and run `./gradlew build` — no Komga artifact needed on the classpath.
+- **REST**: `POST /api/v1/plugins/install` (multipart) accepts a `file` (JAR upload) **or** a `url` (http/https download). `DELETE /api/v1/plugins/{id}` now also unloads + deletes the JAR for external plugins. Admin-only (the whole controller requires `ROLE_ADMIN`).
+- **UI**: the Plugin Manager's Install dialog is now functional — pick a `.jar` or paste a URL, and the plugin loads immediately and shows up in the list.
+
+**Security note:** installing a plugin runs arbitrary code inside the Komga JVM. There is no sandbox (the JVM `SecurityManager` is removed in modern JDKs), so the endpoint is restricted to admins. Only install plugins you trust.
 
 ### New: Auto-Match, Scrobbler, Metron (cherry-picked from jackohagan94-afk's v2.0 branch)
 
@@ -52,7 +68,7 @@ Inspired by [beaux](https://github.com/beaux)'s `komga-enhanced` branch — re-i
 - Search MangaDex by title, pick a target library once via a dropdown
 - Per-result actions: **Download** (queues a new download) and **Follow** (appends `https://mangadex.org/title/<id>` to that library's `follow.txt` — dedupes if the URL is already there)
 - **Advanced filters** (collapsible panel): multi-select for *Include tags*, *Blacklist tags* (MangaDex `excludedTags[]`), Status, Content Rating, Publication Demographic, plus an *Only titles with downloadable chapters* toggle. Server-side `hasAvailableChapters=true` is too loose (counts external-link / 0-page chapters as "available"), so when this toggle is on the UI does an additional batch call to `POST /api/v1/plugins/mangadex-metadata/downloadable-check` which inspects each candidate's `/manga/{id}/feed` for at least one chapter with `externalUrl == null` AND `pages > 0` in the preferred language. **Trade-off:** 1 extra MangaDex API call per uncached result (24h server-side cache). With the toggle off there is zero extra cost. With no title and any filter set the button switches to "Browse" and queries MangaDex sorted by `followedCount desc`.
-- **Persistent filter defaults**: a "Save as default" button stores the current filter combination in browser `localStorage` (`komga-fork.mangadex-search-defaults`). On next visit the panel pre-fills with those values — set a permanent tag blacklist once and forget it. "Clear all" resets the current panel.
+- **Persistent filter defaults**: a "Save as default" button stores the current filter combination in your **Komga account** (user client-setting `komga.fork.mangadexsearch.defaults`), so the defaults follow you across browsers and devices. A previously saved per-browser `localStorage` value is migrated automatically on first load. On next visit the panel pre-fills with those values — set a permanent tag blacklist once and forget it. "Clear all" resets the current panel.
 - **Pagination** — 24 results per page with a `v-pagination` control underneath. `total` is reported by MangaDex (often tens of thousands when filters are loose). MangaDex caps `offset+limit ≤ 10000`, so the UI clamps to 417 pages max at the default 24/page.
 - **Tag catalog cached for 7 days in browser localStorage** (`komga-fork.mangadex-tags-cache`) — first visit hits `GET /api/v1/plugins/mangadex-metadata/tags`, subsequent visits use the local copy. Server-side in-memory cache (`getTags()`) survives until the JVM restarts. MangaDex changes its tag list only a handful of times per year.
 - **Follow button is a toggle** — already-followed titles show `Following` (success-coloured); clicking again locates the line in whichever library's `follow.txt` contains it and removes it. New follows still go to the currently-selected target library.
@@ -82,38 +98,32 @@ New backend endpoints on the MangaDex plugin:
 
 | New / Modified File | Change |
 |---------------------|--------|
-| `infrastructure/download/GalleryDlProcess.kt` | `komga` postprocessor; `chapter_naming` template applied to all sites |
-| `infrastructure/download/GalleryDlWrapper.kt` | Skip ComicInfo injection if already present; `repairMissingComicInfo` gains `forceReinject`; `updateExistingCbzChapterUrls` removed |
-| `domain/persistence/PluginLogRepository.kt` + `infrastructure/jooq/main/PluginLogDao.kt` | `deleteOlderThan` re-added |
-| `domain/persistence/HistoricalEventRepository.kt` + `infrastructure/jooq/main/HistoricalEventDao.kt` | `deleteOlderThan` added (deletes properties then events) |
-| `interfaces/scheduler/PluginLogCleanupController.kt` | NEW — daily PLUGIN_LOG retention (30 days) |
-| `interfaces/scheduler/HistoricalEventCleanupController.kt` | NEW — daily HISTORICAL_EVENT retention (30 days) |
-| `komga-webui/src/views/DownloadDashboard.vue` | MangaDex search card with Download + Follow buttons (inspired by beaux's fork) |
-| `infrastructure/download/MangaDexApiClient.kt` | (existing behavior — all MangaDex tags in `<Genre>`) |
-| `infrastructure/download/ComicInfoGenerator.kt` | (existing behavior — only `<Genre>`) |
-| `interfaces/api/rest/DownloadController.kt` | `?force=true` for `repair-comicinfo` endpoint |
-| `komga-webui/src/views/SettingsFixes.vue` | NEW — Fixes page with Re-inject ComicInfo card |
-| `komga-webui/src/router.ts` | Route `/settings/fixes` |
-| `komga-webui/src/views/HomeView.vue` | "Fixes" navigation item under Settings |
-| `komga/docker/Dockerfile.local` + `Dockerfile.tpl` | Use `gallery-dl-komga` fork tarball instead of PyPI |
-| `README.md` | Install/update instructions for `gallery-dl-komga` |
-| `infrastructure/automatch/*` (5 files) | NEW — TitleNormalizer, Matcher, Applier, EventListener, SeriesJsonWriter |
-| `infrastructure/metadata/metron/*` (2 files) | NEW — Metron HTTP client + Plugin |
-| `infrastructure/scrobbler/*` (4 files) | NEW — MangaScrobbler, MangaSyncPuller, TrackerIdResolver, PluginVersions |
-| `infrastructure/comicscrobbler/ComicScrobblerPlugin.kt` | NEW — Metron-based comic scrobbler |
-| `infrastructure/metadata/tracker/TrackerLinkEnricher.kt` | NEW |
-| `infrastructure/rate/MetronRateLimiter.kt` | NEW |
-| `infrastructure/jooq/main/SyncStateDao.kt` | NEW |
-| `domain/model/SyncState.kt` + `domain/persistence/SyncStateRepository.kt` | NEW |
-| `flyway/.../V20260511000000__add_sync_state.sql` | NEW |
-| `interfaces/api/rest/AutoMatchController.kt` | NEW — bulk match endpoint |
-| `application/tasks/Task.kt` + `TaskEmitter.kt` + `TaskHandler.kt` | New AutoMatchSeriesMetadata task |
-| `application/startup/PluginInitializer.kt` | 4 new plugin definitions; auto-metadata registered as `PROCESSOR`; `chapter_naming` field on gallery-dl |
-| `interfaces/api/rest/PluginController.kt` | `provider` field on DTO; status alias expansion; provider-aware `web_url` |
-| `infrastructure/metadata/mylar/MylarSeriesProvider.kt` | Multi-tracker WebLink generation |
-| `infrastructure/metadata/mylar/dto/MylarMetadata.kt` | `tracker_links` field |
-| `infrastructure/metadata/mylar/dto/Status.kt` | More JsonAlias for AniList/Kitsu |
-| `infrastructure/scrobbler/MangaScrobblerPlugin.kt` | MangaDex credential fallback to MangaDex Subscription Sync |
+| `infrastructure/download/GalleryDlProcess.kt` | `komga` postprocessor; `chapter_naming` template |
+| `infrastructure/download/GalleryDlWrapper.kt` | Skip ComicInfo if already present; `repairMissingComicInfo` `forceReinject`; `updateExistingCbzChapterUrls` removed |
+| `infrastructure/download/MangaDexApiClient.kt` + `ComicInfoGenerator.kt` | All MangaDex tags in `<Genre>` |
+| `interfaces/api/rest/DownloadController.kt` | `repair-comicinfo` `?force=true` + async status |
+| `komga-webui/.../SettingsFixes.vue` + `router.ts` + `HomeView.vue` | NEW Fixes page — Re-inject ComicInfo, runs in background (resume on return) |
+| `interfaces/scheduler/PluginLogCleanupController.kt` (7d) + `HistoricalEventCleanupController.kt` (30d) | NEW daily retention; `deleteOlderThan` on the log/event repos+DAOs |
+| `infrastructure/automatch/*` | NEW auto-match (TitleNormalizer/Matcher/Applier/EventListener/SeriesJsonWriter). Runs for new series + explicit bulk only; `tracker_links` require a strong title match |
+| `interfaces/api/rest/AutoMatchController.kt` + `application/tasks/*` | NEW bulk-match endpoint + `AutoMatchSeriesMetadata` task |
+| `infrastructure/scrobbler/*` + `comicscrobbler/*` | NEW Manga/Comic scrobblers (`SCROBBLER` type); shared-MangaDex-credential fallback |
+| `infrastructure/metadata/tracker/TrackerLinkEnricher.kt`, `rate/MetronRateLimiter.kt`, `sync_state` (model/repo/DAO + migration `V20260511000000`) | NEW |
+| `infrastructure/metadata/mylar/*` | Multi-tracker WebLinks; `tracker_links` field; AniList/Kitsu status aliases |
+| `komga-webui/.../DownloadDashboard.vue` | NEW MangaDex search card: Download/Follow, advanced filters, pagination, tag cache, **Sort by**, description dialog; "Save as default" stored in account |
+| `infrastructure/plugin/api/KomgaPlugin.kt` | NEW external-plugin SPI (`KomgaPlugin`/`MetadataProviderPlugin`/`NotifierPlugin`/`PluginContext`/`configSchema` + DTOs) |
+| `infrastructure/plugin/PluginLoader.kt` | NEW per-JAR `URLClassLoader` + `ServiceLoader` |
+| `infrastructure/plugin/PluginRegistry.kt` | NEW scan/install/uninstall of `${config-dir}/plugins`; bundles & refreshes default plugins on startup; `OnlineMetadataProvider` bridge; notifier dispatch on download events |
+| `interfaces/api/rest/PluginController.kt` + `dto/PluginDto.kt` | `POST /plugins/install` (file/URL); dynamic provider resolution; provider-aware `web_url`; `external` flag (built-ins can't be uninstalled); apply-metadata/apply-cover |
+| `komga-webui/.../PluginManager.vue` | Install upload; Auto Metadata Match GUI config (ordered providers + library multiselect); uninstall hidden for built-ins |
+| `application/startup/PluginInitializer.kt` + `domain/model/Plugin.kt` | Built-in defs (gallery-dl/MangaDex/scrobblers/auto-metadata/subscription); syncs metadata on startup; `SCROBBLER` type; Subscription Sync is `PROCESSOR` |
+| `plugins/kitsu-plugin`, `plugins/anilist-plugin`, `plugins/metron-plugin` | NEW — Kitsu/AniList/Metron as default external plugins (built-ins removed); MangaDex stays built-in |
+| `plugins/plugin-template` + `PLUGINS.md` | NEW authoring template + guide |
+| `settings.gradle` + `komga/build.gradle.kts` | Auto-discover `plugins/*` as `:plugins:<name>` (template skipped); bundle all `:plugins:*` jars as default plugins |
+| `infrastructure/jooq/main/PageHashDao.kt` + `domain/model/PageHashUnknown.kt` + `dto/PageHashUnknownDto.kt` | Unknown duplicate pages expose `seriesTitle` (read-only, no migration) |
+| `komga-webui/.../DuplicatePagesUnknown.vue` + `PageHashUnknownCard.vue` | Sort by Manga/Series; show series title; fixed-width cards |
+| `komga-webui/.../EditSeriesDialog.vue` | Search Online covers use native `<img referrerpolicy=no-referrer>` |
+| `komga/docker/Dockerfile.local` + `Dockerfile.tpl` | Use `gallery-dl-komga` fork |
+| `README.md` + UI strings | Install/plugins/VACUUM docs; all UI text in English |
 
 ---
 
@@ -149,12 +159,12 @@ New backend endpoints on the MangaDex plugin:
 
 | File | Change |
 |------|--------|
-| `infrastructure/mediacontainer/epub/Nav.kt` | EPUB TOC: XML-Parser für korrekte TOC-Verarbeitung |
-| `infrastructure/kobo/KoboProxy.kt` | Kobo: Request-Body als `ByteArray` proxied |
-| `interfaces/api/kosync/KoreaderSyncController.kt` | KOReader: akzeptiert auch `application/json` |
-| `interfaces/api/opds/v2/Opds2Controller.kt` | OPDS2: `series/latest` Navigation-Link-Fix |
-| `interfaces/api/OpdsGenerator.kt` | OPDS2: Auth-Logo-URL korrekt bei Base-URL |
-| `interfaces/api/rest/dto/UserDto.kt` | API: `ageRestriction` wird ausgeblendet statt als `null` gesendet |
+| `infrastructure/mediacontainer/epub/Nav.kt` | EPUB TOC: XML parser for correct TOC handling |
+| `infrastructure/kobo/KoboProxy.kt` | Kobo: request body proxied as `ByteArray` |
+| `interfaces/api/kosync/KoreaderSyncController.kt` | KOReader: also accepts `application/json` |
+| `interfaces/api/opds/v2/Opds2Controller.kt` | OPDS2: `series/latest` navigation link fix |
+| `interfaces/api/OpdsGenerator.kt` | OPDS2: auth logo URL correct with base URL |
+| `interfaces/api/rest/dto/UserDto.kt` | API: `ageRestriction` is hidden instead of sent as `null` |
 
 ### Bug Fixes
 - **Page hashes wiped on every re-analyze — duplicate count collapses during scans** — `BookLifecycle.analyzeAndPersist` called `mediaRepository.update(media)` with the fresh `Media` returned by `BookAnalyzer.analyze`, which constructs brand-new `BookPage` objects in `analyzeDivina` without a `fileHash` (defaults to `""`). Any time a book was marked `OUTDATED` (mtime change without `hashFiles` enabled, or actual content change), all previously computed page hashes were dropped, `getBookIdsWithMissingPageHash` re-enqueued the book, and `hashPages` re-read every first/last N page from disk again. During a library scan this also caused the Duplicate Pages / Unknown view to collapse (e.g. 22×50 rows → 2) because the `findAllUnknown` query counts pages with `FILE_HASH != ''` and the re-analyze pass had just blanked them. Fix: `analyzeAndPersist` now reads the previous `Media` inside the transaction and runs `media.pages.restoreHashFrom(previous.pages)` before persisting — the same helper already used by `BookConverter` and `BookPageEditor` matches pages by `fileName + fileSize + mediaType` and copies the old `fileHash` forward. Pages that genuinely changed (different size or renamed) still get re-hashed; untouched pages keep their hash across scans.

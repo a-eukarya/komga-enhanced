@@ -6,9 +6,8 @@ import org.gotson.komga.domain.persistence.PluginConfigRepository
 import org.gotson.komga.domain.persistence.PluginRepository
 import org.gotson.komga.domain.service.MetadataSearchResult
 import org.gotson.komga.domain.service.OnlineMetadataProvider
-import org.gotson.komga.infrastructure.metadata.anilist.AniListMetadataPlugin
-import org.gotson.komga.infrastructure.metadata.kitsu.KitsuMetadataPlugin
 import org.gotson.komga.infrastructure.metadata.mangadex.MangaDexMetadataPlugin
+import org.gotson.komga.infrastructure.plugin.PluginRegistry
 import org.springframework.stereotype.Service
 
 private val logger = KotlinLogging.logger {}
@@ -48,9 +47,8 @@ data class AutomatchScanResult(
 class AutoMetadataMatcher(
   private val pluginRepository: PluginRepository,
   private val pluginConfigRepository: PluginConfigRepository,
-  private val anilist: AniListMetadataPlugin,
   private val mangadex: MangaDexMetadataPlugin,
-  private val kitsu: KitsuMetadataPlugin,
+  private val pluginRegistry: PluginRegistry,
 ) {
   companion object {
     const val AUTO_PLUGIN_ID = "auto-metadata"
@@ -58,12 +56,12 @@ class AutoMetadataMatcher(
     const val DEFAULT_MIN_SCORE = 0.85
   }
 
+  // mangadex is a built-in bean; everything else (anilist, kitsu, metron, any
+  // external metadata plugin) is resolved dynamically from the plugin registry.
   private fun providerById(id: String): OnlineMetadataProvider? =
     when (id) {
-      "anilist", "anilist-metadata" -> anilist
       "mangadex", "mangadex-metadata" -> mangadex
-      "kitsu", "kitsu-metadata" -> kitsu
-      else -> null
+      else -> pluginRegistry.metadataProviderFor(fullPluginId(id))
     }
 
   private fun fullPluginId(short: String): String = if (short.endsWith("-metadata")) short else "$short-metadata"
@@ -100,7 +98,9 @@ class AutoMetadataMatcher(
         .findByPluginIdAndKey(AUTO_PLUGIN_ID, "min_score_tracker_links")
         ?.configValue
         ?.toDoubleOrNull()
-    val raw = explicit ?: (p - 0.08)
+    // default to the same confidence as the primary match so a cross-site link is
+    // only added when that provider's title genuinely matches (avoids wrong links)
+    val raw = explicit ?: p
     return raw.coerceIn(0.0, p)
   }
 

@@ -622,17 +622,16 @@
                     :key="result.externalId"
                   >
                     <v-card @click="applyMetadataResult(result)" hover>
-                      <v-img
-                        :src="result.coverUrl || ''"
-                        aspect-ratio="0.7"
-                        class="white--text"
-                      >
-                        <template v-slot:placeholder>
-                          <v-row class="fill-height ma-0" align="center" justify="center">
-                            <v-icon size="64">mdi-book</v-icon>
-                          </v-row>
-                        </template>
-                      </v-img>
+                      <div class="grey lighten-3 d-flex align-center justify-center" style="width:100%;padding-top:142%;position:relative;">
+                        <img
+                          v-if="result.coverUrl"
+                          :src="result.coverUrl"
+                          referrerpolicy="no-referrer"
+                          alt=""
+                          style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;"
+                        />
+                        <v-icon v-else size="64" color="grey lighten-1" style="position:absolute;">mdi-book</v-icon>
+                      </div>
                       <v-card-title class="subtitle-2">{{ result.title }}</v-card-title>
                       <v-card-subtitle v-if="result.author">
                         <v-icon small>mdi-account</v-icon>
@@ -1059,6 +1058,7 @@ export default Vue.extend({
               this.series.id,
               metadata,
               result.externalId,
+              this.metadataSearch.selectedPlugin,
             )
           } catch (err) {
             this.$eventHub.$emit(ERROR, {message: `series.json failed: ${err.message}`} as ErrorEvent)

@@ -991,11 +991,6 @@ class GalleryDlWrapper(
 
       comicInfoGenerator.injectComicInfo(cbzPath, comicInfoXml, zipComment)
 
-      logToDatabase(
-        org.gotson.komga.domain.model.LogLevel.INFO,
-        "Injected ComicInfo.xml into ${cbzPath.fileName}" +
-          if (chapterInfo != null) " (chapter ${chapterInfo.chapterNumber})" else "",
-      )
       logger.debug {
         "Added ComicInfo.xml to ${cbzPath.fileName}" +
           if (chapterInfo != null) " with chapter metadata (ch. ${chapterInfo.chapterNumber})" else ""
@@ -1026,11 +1021,6 @@ class GalleryDlWrapper(
 
       comicInfoGenerator.injectComicInfoWithRetry(cbzPath, comicInfoXml, zipComment)
 
-      logToDatabase(
-        org.gotson.komga.domain.model.LogLevel.INFO,
-        "Injected ComicInfo.xml into ${cbzPath.fileName}" +
-          if (chapterInfo != null) " (chapter ${chapterInfo.chapterNumber})" else "",
-      )
       logger.debug {
         "Added ComicInfo.xml to ${cbzPath.fileName}" +
           if (chapterInfo != null) " with chapter metadata (ch. ${chapterInfo.chapterNumber})" else ""
@@ -1184,21 +1174,12 @@ class GalleryDlWrapper(
     message: String,
     exceptionTrace: String? = null,
   ) {
-    try {
-      val log =
-        org.gotson.komga.domain.model.PluginLog(
-          id =
-            com.github.f4b6a3.tsid.TsidCreator
-              .getTsid256()
-              .toString(),
-          pluginId = pluginId,
-          logLevel = level,
-          message = message,
-          exceptionTrace = exceptionTrace,
-        )
-      pluginLogRepository.insert(log)
-    } catch (e: Exception) {
-      logger.error(e) { "Failed to write plugin log to database: $message" }
+    val line = "[$pluginId] $message"
+    when (level) {
+      org.gotson.komga.domain.model.LogLevel.ERROR -> logger.error { exceptionTrace?.let { "$line\n$it" } ?: line }
+      org.gotson.komga.domain.model.LogLevel.WARN -> logger.warn { line }
+      org.gotson.komga.domain.model.LogLevel.DEBUG -> logger.debug { line }
+      else -> logger.info { line }
     }
   }
 

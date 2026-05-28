@@ -106,11 +106,10 @@ class TaskHandler(
 
           is Task.RefreshSeriesMetadata ->
             seriesRepository.findByIdOrNull(task.seriesId)?.let { series ->
-              try {
-                autoMetadataApplier.apply(series, force = false, triggerRefresh = false)
-              } catch (e: Exception) {
-                logger.warn(e) { "Auto-match failed during refresh for series='${series.name}', continuing with normal refresh" }
-              }
+              // Auto-match is NOT run here: it would fire on every routine refresh and
+              // overwrite/append links across all providers even when the user only
+              // applied one provider manually. Auto-match runs for new series
+              // (AutoMetadataEventListener) and explicit bulk match (AutoMatchController).
               seriesMetadataLifecycle.refreshMetadata(series)
               taskEmitter.aggregateSeriesMetadata(series.id, priority = task.priority)
             } ?: logger.warn { "Cannot execute task $task: Series does not exist" }

@@ -1,5 +1,5 @@
 <template>
-  <v-card>
+  <v-card width="440">
     <v-container fluid>
       <v-row>
         <v-col>
@@ -16,6 +16,14 @@
         <v-col>
           <v-card-text style="min-width: 200px">
             <v-container>
+              <v-row v-if="hash.seriesTitle">
+                <v-col>
+                  <div class="font-weight-medium text-truncate" style="max-width: 200px" :title="hash.seriesTitle">
+                    <v-icon small class="me-1">mdi-book-multiple</v-icon>{{ hash.seriesTitle }}
+                  </div>
+                </v-col>
+              </v-row>
+
               <v-row>
                 <v-col>
                   <div>{{ getFileSize(hash.size) || $t('duplicate_pages.unknown_size') }}</div>

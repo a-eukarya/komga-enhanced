@@ -27,6 +27,7 @@ enum class PluginType {
   PROCESSOR, // Content processors
   NOTIFIER, // Notification plugins
   ANALYZER, // Content analyzers
+  SCROBBLER, // Read-progress trackers (AniList/MAL/Kitsu/Metron)
 }
 
 data class PluginPermission(

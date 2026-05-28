@@ -17,7 +17,7 @@ class PluginLogCleanupController(
 ) {
   @Scheduled(fixedRate = 86_400_000)
   fun cleanup() {
-    val olderThan = LocalDateTime.now(ZoneId.of("Z")).minusDays(30)
+    val olderThan = LocalDateTime.now(ZoneId.of("Z")).minusDays(7)
     logger.info { "Remove plugin logs older than $olderThan (UTC)" }
     pluginLogRepository.deleteOlderThan(olderThan)
   }

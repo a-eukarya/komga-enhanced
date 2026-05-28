@@ -261,6 +261,8 @@ class MangaDexMetadataPlugin(
     hasAvailableChapters: Boolean?,
     offset: Int,
     limit: Int,
+    order: String? = null,
+    orderDir: String? = null,
   ): MangaDexSearchPage {
     return try {
       val preferredLang = getPreferredLanguage()
@@ -288,7 +290,12 @@ class MangaDexMetadataPlugin(
             effectiveRatings.forEach { builder.queryParam("contentRating[]", it) }
             publicationDemographic.forEach { builder.queryParam("publicationDemographic[]", it) }
             if (hasAvailableChapters == true) builder.queryParam("hasAvailableChapters", "true")
-            if (query.isNullOrBlank()) builder.queryParam("order[followedCount]", "desc")
+            val safeOrderFields = setOf("followedCount", "relevance", "latestUploadedChapter", "createdAt", "updatedAt", "title", "rating", "year")
+            val dir = if (orderDir == "asc") "asc" else "desc"
+            when {
+              order != null && order in safeOrderFields -> builder.queryParam("order[$order]", dir)
+              query.isNullOrBlank() -> builder.queryParam("order[followedCount]", "desc")
+            }
             builder.build()
           }.retrieve()
           .body(String::class.java) ?: return MangaDexSearchPage(emptyList(), 0, effectiveOffset, effectiveLimit)
@@ -324,15 +331,16 @@ class MangaDexMetadataPlugin(
     downloadableCache[key]?.let { (value, ts) ->
       if (Instant.now().isBefore(ts.plus(downloadableCacheTtl))) return value
     }
+    // null = transient error → don't cache (otherwise a blip hides the title for 24h)
     val result = computeHasDownloadable(mangaId, language)
-    downloadableCache[key] = result to Instant.now()
-    return result
+    if (result != null) downloadableCache[key] = result to Instant.now()
+    return result ?: false
   }
 
   private fun computeHasDownloadable(
     mangaId: String,
     language: String,
-  ): Boolean {
+  ): Boolean? {
     try {
       val response =
         restClient
@@ -362,8 +370,8 @@ class MangaDexMetadataPlugin(
         }
       }
     } catch (e: Exception) {
-      logger.warn(e) { "downloadable-check failed for $mangaId ($language) — assuming false" }
-      return false
+      logger.warn(e) { "downloadable-check failed for $mangaId ($language) — assuming false (not cached)" }
+      return null
     }
   }
 

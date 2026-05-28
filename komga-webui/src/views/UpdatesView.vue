@@ -76,17 +76,17 @@
       <v-tab-item>
         <div v-if="$store.getters.isForkLatestVersion() == 1">
           <v-alert type="success" text>
-            Fork ist auf dem neuesten Stand
+            Fork is up to date
           </v-alert>
         </div>
         <div v-if="$store.getters.isForkLatestVersion() == 0">
           <v-alert type="warning" text>
-            Fork-Update verfügbar
+            Fork update available
           </v-alert>
         </div>
         <div v-if="$store.state.forkReleases.length == 0">
           <v-alert type="info" text>
-            Keine Fork-Releases gefunden
+            No fork releases found
           </v-alert>
         </div>
 

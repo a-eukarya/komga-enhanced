@@ -229,7 +229,7 @@ Rich metadata from multiple sources:
 - Configurable title preference (English/Romaji/Native)
 - Detailed series information
 
-**Kitsu Metadata Plugin:**
+**Kitsu Metadata Plugin** *(ships as a default external plugin — see [Custom Plugins](#custom-plugins-external-jars)):*
 - Fetches title, synopsis, authors, genres, age rating
 - Alternative titles in multiple languages
 - Cover art downloading
@@ -248,7 +248,21 @@ Komf-style automatic provider matching for new series on scan:
 - Scores candidates by normalized-title Jaccard similarity (default threshold `0.85`)
 - Writes a `web_url` plus multi-source `tracker_links` into `series.json`, so `MylarSeriesProvider` produces one WebLink per matched site
 - Bulk-match existing series: `POST /api/v1/automatch/libraries/{id}`
-- Configured via `Plugin Manager → Auto Metadata Match`; **does not** appear in the per-series *Search Online Databases* dialog (it runs as a background processor, not a manual search provider)
+- Configured via `Plugin Manager → Auto Metadata Match` with a **GUI** (drag-free ordered provider list + library multi-select) instead of raw CSV; **does not** appear in the per-series *Search Online Databases* dialog (it runs as a background processor, not a manual search provider)
+- Works with **external metadata plugins** too — any installed `MetadataProviderPlugin` becomes selectable in the provider priority
+
+### Custom Plugins (External JARs)
+
+Beyond the built-in plugins, the fork can **load external plugin JARs at runtime** — drop them into `<config-dir>/plugins/` or upload via **Plugin Manager → Install Plugin** (file or URL). Built-in plugins stay compiled in and **cannot be uninstalled**; only external plugins are removable.
+
+> **Docker:** the plugins folder lives at `/config/plugins`, which is **already inside the mounted `/config` volume** — no extra volume mount is needed. Drop JARs there (or upload via the UI) and they persist across container restarts. The bundled default plugins (e.g. Kitsu) are auto-installed there on first start.
+
+- **Two plugin types today:** `MetadataProviderPlugin` (search + metadata, shows up in *Search Online Databases* and Auto Metadata Match) and `NotifierPlugin` (receives `DOWNLOAD_COMPLETED` / `DOWNLOAD_FAILED` events — webhook, Discord, …)
+- **Isolated class loading** — each JAR runs in its own class loader; load failures never crash the server
+- **Default external plugin:** the **Kitsu** provider is shipped this way (bundled in the app, auto-installed on first start) as the reference implementation
+- **Write your own:** copy [`plugins/plugin-template`](plugins/plugin-template), edit one Kotlin file, run `./gradlew build`, install the JAR. Full guide: **[PLUGINS.md](PLUGINS.md)**
+
+> **Security:** installing a plugin runs arbitrary code inside the Komga JVM (no sandbox). The install endpoint is admin-only — only install plugins you trust.
 
 ### MangaDex Search on Downloads Page
 
@@ -273,7 +287,7 @@ With no title and at least one filter set, the button switches to **Browse** and
 
 **Tag catalog cached 7 days in your browser** — the tag dropdown is filled from `GET /api/v1/plugins/mangadex-metadata/tags` on first use, then served from `localStorage` for a week (MangaDex updates its tags only a few times a year). No tag fetch on every page load.
 
-**Persistent defaults** — a **Save as default** button writes the current filter combination to browser `localStorage` (`komga-fork.mangadex-search-defaults`). On the next visit the panel pre-fills with those values, so you can set a permanent tag blacklist once and forget about it. **Clear all** resets the current selection without touching the saved default.
+**Persistent defaults** — a **Save as default** button writes the current filter combination to your **Komga account** (user client-setting `komga.fork.mangadexsearch.defaults`), so defaults follow you across browsers and devices (a previously saved per-browser `localStorage` value is migrated automatically). On the next visit the panel pre-fills with those values, so you can set a permanent tag blacklist once and forget about it. **Clear all** resets the current selection without touching the saved default.
 
 **Already-followed titles are marked** — on page load the search card pre-fetches every library's `follow.txt`, extracts the MangaDex UUIDs, and uses that set to flip every result's Follow button to "Following" state. No special filter; just an honest two-state toggle.
 
@@ -373,7 +387,7 @@ Override the gallery-dl `directory` template per-install via the **Plugin Manage
 
 GUI-triggered one-time maintenance actions under **Settings → Fixes**. Cards are versioned and removed once obsolete.
 
-- **Re-inject ComicInfo.xml** — regenerates `ComicInfo.xml` + `series.json` for every CBZ in the selected library from MangaDex metadata. Enable *Force* to overwrite existing ComicInfo (useful when MangaDex metadata changed, or when migrating libraries that ran an older fork build with a different ComicInfo layout).
+- **Re-inject ComicInfo.xml** — regenerates `ComicInfo.xml` + `series.json` for every CBZ in the selected library from MangaDex metadata. Enable *Force* to overwrite existing ComicInfo (useful when MangaDex metadata changed, or when migrating libraries that ran an older fork build with a different ComicInfo layout). Runs in the background — you can leave the page and return to watch progress.
 
 ### Database Hygiene
 
@@ -381,6 +395,8 @@ Two scheduled jobs run daily and prune log/event tables to keep the SQLite file 
 
 - `PLUGIN_LOG` — entries older than 30 days are deleted (was unbounded; observed 119k+ rows on installs without retention)
 - `HISTORICAL_EVENT` + `HISTORICAL_EVENT_PROPERTIES` — pruned together (the schema has no `ON DELETE CASCADE`, so the DAO deletes properties first then events)
+
+> **Note on file size:** SQLite does **not** shrink `database.sqlite` when rows are deleted — freed pages are reused for future writes but the file stays the same size on disk (it just stops growing). To actually reclaim space, run `VACUUM;` once against the database while Komga is stopped (e.g. `sqlite3 database.sqlite "VACUUM;"`). Retention prevents unbounded growth; VACUUM is the one-time reclaim.
 
 ### Auto-Scan After Download
 
@@ -431,6 +447,8 @@ docker exec -u 0 komga pip3 install --break-system-packages -U https://github.co
 ```bash
 java -jar komga.jar
 ```
+
+> Install **[gallery-dl-komga](https://github.com/08shiro80/gallery-dl-komga)** (the fork, see [Requirements](#requirements)) — the download/ComicInfo features rely on the fork's `komga` postprocessor, not upstream PyPI `gallery-dl`. Point the gallery-dl Downloader plugin's `gallery_dl_path` at a local checkout if needed.
 
 ### Important: Metadata Completeness
 

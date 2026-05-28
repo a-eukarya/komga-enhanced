@@ -6,3 +6,15 @@ buildCache {
 
 include 'komga'
 include 'komga-tray'
+
+// Auto-discover plugin subprojects under plugins/ — any folder with a build.gradle.kts
+// is included as :plugins:<name>. plugin-template is skipped: it is a standalone project
+// with its own settings.gradle.kts and must NOT be a subproject (Gradle would error).
+def pluginsDir = new File(rootDir, 'plugins')
+if (pluginsDir.isDirectory()) {
+  pluginsDir.eachDir { dir ->
+    if (dir.name != 'plugin-template' && new File(dir, 'build.gradle.kts').exists()) {
+      include "plugins:${dir.name}"
+    }
+  }
+}
