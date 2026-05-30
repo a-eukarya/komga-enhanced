@@ -11,6 +11,10 @@ on:
         description: 'Test build: push to private Docker repo (08shiro80/komga-private) only, skip tag and GitHub Release'
         default: false
         type: boolean
+      docker_testing:
+        description: 'Throwaway smoke build: push to 08shiro80/testing:latest only, skip everything else'
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -67,16 +71,25 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      - name: Cache built komga JAR
+        id: cache_jar
+        uses: actions/cache@v4
+        with:
+          path: komga/build/libs/
+          key: komga-jar-${{ steps.versions.outputs.version_next }}-${{ hashFiles('komga/src/**', 'komga-webui/src/**', 'komga-webui/package-lock.json', '**/build.gradle.kts', 'settings.gradle', 'gradle.properties', 'plugins/**/build.gradle.kts', 'plugins/**/src/**') }}
+
       - name: Setup Gradle
+        if: steps.cache_jar.outputs.cache-hit != 'true'
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build
+        if: steps.cache_jar.outputs.cache-hit != 'true'
         run: ./gradlew :komga:prepareThymeLeaf :komga:bootJar
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"
 
       - name: Create tag via API (verified)
-        if: ${{ !inputs.docker_private }}
+        if: ${{ !inputs.docker_private && !inputs.docker_testing }}
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
@@ -104,7 +117,7 @@ jobs:
             -f sha="$TAG_SHA"
 
       - name: Create GitHub Release
-        if: ${{ !inputs.docker_private }}
+        if: ${{ !inputs.docker_private && !inputs.docker_testing }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.versions.outputs.version_next }}
@@ -131,7 +144,9 @@ jobs:
         id: docker_tags
         run: |
           VER="${{ steps.versions.outputs.version_next }}"
-          if [ "${{ inputs.docker_private }}" = "true" ]; then
+          if [ "${{ inputs.docker_testing }}" = "true" ]; then
+            TAGS="08shiro80/testing:latest"
+          elif [ "${{ inputs.docker_private }}" = "true" ]; then
             TAGS="08shiro80/komga-private:latest
           08shiro80/komga-private:${VER}"
           else
@@ -148,12 +163,21 @@ jobs:
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
+      - name: Resolve gallery-dl-komga master SHA
+        id: gallery_rev
+        run: |
+          SHA=$(curl -fsSL "https://api.github.com/repos/08shiro80/gallery-dl-komga/commits/master" | jq -r .sha)
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "gallery-dl-komga master @ ${SHA}"
+
       - name: Build and push Docker images
         uses: docker/build-push-action@v7
         with:
           context: docker-build
           platforms: linux/amd64,linux/arm64
           push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            GALLERY_DL_REV=${{ steps.gallery_rev.outputs.sha }}
+          cache-from: type=gha,scope=komga-docker
+          cache-to: type=gha,scope=komga-docker,mode=max
           tags: ${{ steps.docker_tags.outputs.tags }}
