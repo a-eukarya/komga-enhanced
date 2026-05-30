@@ -22,6 +22,7 @@ import org.gotson.komga.interfaces.api.rest.dto.PageHashUnknownDto
 import org.gotson.komga.interfaces.api.rest.dto.toDto
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
+import org.springframework.http.CacheControl
 import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
@@ -37,6 +38,7 @@ import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
 import org.springframework.web.server.ResponseStatusException
+import java.util.concurrent.TimeUnit
 
 @RestController
 @RequestMapping("api/v1/page-hashes", produces = [MediaType.APPLICATION_JSON_VALUE])
@@ -95,6 +97,7 @@ class PageHashController(
       ResponseEntity
         .ok()
         .contentType(getMediaTypeOrDefault(it.mediaType))
+        .cacheControl(CacheControl.maxAge(7, TimeUnit.DAYS).cachePrivate())
         .body(it.bytes)
     } ?: throw ResponseStatusException(HttpStatus.NOT_FOUND)
 

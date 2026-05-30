@@ -69,7 +69,7 @@ class AutoMetadataApplier(
       return ApplyOutcome(matched = false, skippedReason = "already-linked")
     }
 
-    val scan = matcher.scan(series)
+    val scan = matcher.scan(series, searchTitle = meta.title.takeIf { it.isNotBlank() } ?: series.name)
     val match = scan.primary ?: return ApplyOutcome(matched = false, skippedReason = "no-match-above-threshold")
 
     val details =

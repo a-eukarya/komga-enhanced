@@ -116,10 +116,10 @@ export default Vue.extend({
       } as any,
       dialogDetails: false,
       dialogDetailsItem: undefined as HistoricalEventDto | undefined,
-      seriesCache: [] as SeriesDto[],
-      seriesCacheNotFound: [] as string[],
-      booksCache: [] as BookDto[],
-      booksCacheNotFound: [] as string[],
+      seriesCache: {} as Record<string, SeriesDto>,
+      seriesCacheNotFound: {} as Record<string, true>,
+      booksCache: {} as Record<string, BookDto>,
+      booksCacheNotFound: {} as Record<string, true>,
     }
   },
   watch: {
@@ -156,10 +156,10 @@ export default Vue.extend({
       } as any
     },
     getSeries(seriesId: string): SeriesDto | undefined {
-      return this.seriesCache.find(x => x.id === seriesId)
+      return this.seriesCache[seriesId]
     },
     getBook(bookId: string): BookDto | undefined {
-      return this.booksCache.find(x => x.id === bookId)
+      return this.booksCache[bookId]
     },
     showDetails(item: HistoricalEventDto) {
       this.dialogDetailsItem = item
@@ -200,21 +200,33 @@ export default Vue.extend({
       this.totalElements = itemsPage.totalElements
       this.items = itemsPage.content
 
-      for (const seriesId of new Set(this.items.map(x => x.seriesId))) {
-        if (seriesId && !this.seriesCacheNotFound.includes(seriesId) && !this.getSeries(seriesId)) {
-          this.$komgaSeries.getOneSeries(seriesId)
-            .then(s => this.seriesCache.push(s))
-            .catch(() => this.seriesCacheNotFound.push(seriesId))
-        }
-      }
+      const newSeriesIds = [...new Set(this.items.map(x => x.seriesId))]
+        .filter(id => id && !this.seriesCache[id] && !this.seriesCacheNotFound[id]) as string[]
+      const newBookIds = [...new Set(this.items.map(x => x.bookId))]
+        .filter(id => id && !this.booksCache[id] && !this.booksCacheNotFound[id]) as string[]
 
-      for (const bookId of new Set(this.items.map(x => x.bookId))) {
-        if (bookId && !this.booksCacheNotFound.includes(bookId) && !this.getBook(bookId)) {
-          this.$komgaBooks.getBook(bookId)
-            .then(b => this.booksCache.push(b))
-            .catch(() => this.booksCacheNotFound.push(bookId))
-        }
-      }
+      const [seriesResults, bookResults] = await Promise.all([
+        Promise.allSettled(newSeriesIds.map(id => this.$komgaSeries.getOneSeries(id))),
+        Promise.allSettled(newBookIds.map(id => this.$komgaBooks.getBook(id))),
+      ])
+
+      const nextSeriesCache = {...this.seriesCache}
+      const nextSeriesNotFound = {...this.seriesCacheNotFound}
+      seriesResults.forEach((r, i) => {
+        if (r.status === 'fulfilled') nextSeriesCache[newSeriesIds[i]] = r.value
+        else nextSeriesNotFound[newSeriesIds[i]] = true
+      })
+      this.seriesCache = nextSeriesCache
+      this.seriesCacheNotFound = nextSeriesNotFound
+
+      const nextBooksCache = {...this.booksCache}
+      const nextBooksNotFound = {...this.booksCacheNotFound}
+      bookResults.forEach((r, i) => {
+        if (r.status === 'fulfilled') nextBooksCache[newBookIds[i]] = r.value
+        else nextBooksNotFound[newBookIds[i]] = true
+      })
+      this.booksCache = nextBooksCache
+      this.booksCacheNotFound = nextBooksNotFound
 
       this.loading = false
     },

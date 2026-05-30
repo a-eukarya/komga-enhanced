@@ -52,50 +52,6 @@ enum class DownloadStatus {
   CANCELLED,
 }
 
-data class UpdateCheck(
-  val id: String,
-  val seriesId: String,
-  val sourceUrl: String,
-  val lastCheckDate: LocalDateTime,
-  val latestChapter: String?,
-  val newChaptersCount: Int = 0,
-  val checkEnabled: Boolean = true,
-  val checkFrequency: Int = 24, // hours
-  val pluginId: String?,
-  val metadataJson: String?,
-  override val createdDate: LocalDateTime = LocalDateTime.now(),
-  override val lastModifiedDate: LocalDateTime = LocalDateTime.now(),
-) : Auditable {
-  fun hasNewChapters() = newChaptersCount > 0
-
-  fun shouldCheck(): Boolean {
-    if (!checkEnabled) return false
-    val hoursSinceLastCheck =
-      java.time.Duration
-        .between(lastCheckDate, LocalDateTime.now())
-        .toHours()
-    return hoursSinceLastCheck >= checkFrequency
-  }
-}
-
-data class UserBlacklist(
-  val id: String,
-  val userId: String,
-  val blacklistType: BlacklistType,
-  val blacklistValue: String,
-  val createdDate: LocalDateTime = LocalDateTime.now(),
-)
-
-enum class BlacklistType {
-  TAG,
-  GENRE,
-  PUBLISHER,
-  AUTHOR,
-  AGE_RATING,
-  SERIES_STATUS,
-  CONTENT_WARNING,
-}
-
 // DTOs for download requests
 data class DownloadRequest(
   val sourceUrl: String,

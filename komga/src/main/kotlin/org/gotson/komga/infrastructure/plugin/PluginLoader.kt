@@ -17,16 +17,37 @@ class LoadedPlugin(
   val jarPath: Path,
 )
 
+private val PLUGIN_ALLOWED_PACKAGE_PREFIXES =
+  listOf(
+    "org.gotson.komga.infrastructure.plugin.api.",
+    "com.fasterxml.jackson.",
+    "java.",
+    "javax.",
+    "kotlin.",
+    "kotlinx.",
+  )
+
+private class SpiOnlyClassLoader(
+  parent: ClassLoader,
+) : ClassLoader(parent) {
+  override fun loadClass(
+    name: String,
+    resolve: Boolean,
+  ): Class<*> {
+    if (PLUGIN_ALLOWED_PACKAGE_PREFIXES.none { name.startsWith(it) }) {
+      throw ClassNotFoundException(
+        "Plugin denied access to '$name' — class-loader isolation. Allowed: SPI ($PLUGIN_ALLOWED_PACKAGE_PREFIXES). Bundle your own libraries into the plugin JAR.",
+      )
+    }
+    return super.loadClass(name, resolve)
+  }
+}
+
 @Component
 class PluginLoader {
-  /**
-   * Loads a single plugin JAR into an isolated class loader whose parent is
-   * Komga's own class loader (so the plugin sees the SPI and Kotlin stdlib).
-   * The implementation is discovered via [ServiceLoader].
-   */
   fun load(jarPath: Path): LoadedPlugin {
     val url = jarPath.toUri().toURL()
-    val classLoader = URLClassLoader(arrayOf(url), javaClass.classLoader)
+    val classLoader = URLClassLoader(arrayOf(url), SpiOnlyClassLoader(javaClass.classLoader))
     try {
       val iterator = ServiceLoader.load(KomgaPlugin::class.java, classLoader).iterator()
       if (!iterator.hasNext()) {

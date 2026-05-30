@@ -191,23 +191,11 @@ class ChapterChecker(
     libraries: Collection<org.gotson.komga.domain.model.Library>,
   ): ChapterCheckResult {
     val mangaId = GalleryDlWrapper.extractMangaDexId(url)
-    if (mangaId == null) {
-      return ChapterCheckResult(
-        url = url,
-        mangaId = null,
-        title = null,
-        apiChapterCount = 0,
-        downloadedChapterCount = 0,
-        filesystemChapterCount = 0,
-        newChaptersEstimate = 0,
-        needsDownload = false,
-        error = "Not a MangaDex URL",
-      )
-    }
+    if (mangaId == null) return checkNonMangaDexUrl(url)
 
     try {
       val chapters = galleryDlWrapper.getChaptersForManga(mangaId)
-      val apiChapterIds = chapters.map { it.chapterId }.toSet()
+      val apiChapterIds = chapters.mapNotNull { it.chapterId }.toSet()
       val mangaInfo = galleryDlWrapper.getMangaMetadata(mangaId)
       val title = mangaInfo?.title
 
@@ -267,6 +255,19 @@ class ChapterChecker(
       )
     }
   }
+
+  // Non-MangaDex sources have no stable identifier (URL domain + title both change), so a reliable "already have it?" pre-check isn't possible. Queue unconditionally; the download resume keys off the on-disk CBZ <Number> and re-downloads only the missing chapters.
+  private fun checkNonMangaDexUrl(url: String): ChapterCheckResult =
+    ChapterCheckResult(
+      url = url,
+      mangaId = null,
+      title = null,
+      apiChapterCount = 0,
+      downloadedChapterCount = 0,
+      filesystemChapterCount = 0,
+      newChaptersEstimate = 0,
+      needsDownload = true,
+    )
 
   private fun findSeriesForManga(
     mangaId: String,

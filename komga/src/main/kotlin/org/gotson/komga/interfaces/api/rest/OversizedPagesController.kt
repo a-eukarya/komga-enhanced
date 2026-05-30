@@ -6,6 +6,7 @@ import org.gotson.komga.domain.model.IgnoredOversizedPage
 import org.gotson.komga.domain.persistence.BookRepository
 import org.gotson.komga.domain.persistence.IgnoredOversizedPageRepository
 import org.gotson.komga.domain.persistence.MediaRepository
+import org.gotson.komga.domain.persistence.SeriesMetadataRepository
 import org.gotson.komga.domain.persistence.SeriesRepository
 import org.gotson.komga.domain.service.BookPageEditor
 import org.gotson.komga.domain.service.PageSplitter
@@ -45,6 +46,7 @@ class OversizedPagesController(
   private val mediaRepository: MediaRepository,
   private val bookRepository: BookRepository,
   private val seriesRepository: SeriesRepository,
+  private val seriesMetadataRepository: SeriesMetadataRepository,
   private val pageSplitter: PageSplitter,
   private val ignoredOversizedPageRepository: IgnoredOversizedPageRepository,
   private val bookPageEditor: BookPageEditor,
@@ -84,10 +86,12 @@ class OversizedPagesController(
     for (book in allBooks) {
       val media = mediaRepository.findByIdOrNull(book.id) ?: continue
       val series = seriesRepository.findByIdOrNull(book.seriesId)
+      val seriesMetadata = seriesMetadataRepository.findByIdOrNull(book.seriesId)
+      val displaySeriesTitle = seriesMetadata?.title?.takeIf { it.isNotBlank() } ?: series?.name.orEmpty()
 
       if (searchTerm != null) {
         val bookMatch = book.name.lowercase().contains(searchTerm)
-        val seriesMatch = series?.name?.lowercase()?.contains(searchTerm) == true
+        val seriesMatch = displaySeriesTitle.lowercase().contains(searchTerm) || series?.name?.lowercase()?.contains(searchTerm) == true
         if (!bookMatch && !seriesMatch) continue
       }
 
@@ -123,7 +127,7 @@ class OversizedPagesController(
                 bookId = book.id,
                 bookName = book.name,
                 seriesId = book.seriesId,
-                seriesTitle = series?.name ?: "",
+                seriesTitle = displaySeriesTitle,
                 pageNumber = pageNumber,
                 width = dimension.width,
                 height = dimension.height,
@@ -137,7 +141,23 @@ class OversizedPagesController(
       }
     }
 
-    oversizedPages.sortByDescending { it.ratio }
+    val order = page.sort.firstOrNull()
+    val sortKey = order?.property ?: "ratio"
+    val descending = order?.isDescending ?: true
+    val keyComparator: Comparator<OversizedPageDto> =
+      when (sortKey) {
+        "fileSize" -> compareBy { it.fileSize }
+        "seriesTitle" -> compareBy(String.CASE_INSENSITIVE_ORDER) { it.seriesTitle }
+        "bookName" -> compareBy(String.CASE_INSENSITIVE_ORDER) { it.bookName }
+        "pageNumber" -> compareBy { it.pageNumber }
+        else -> compareBy { it.ratio }
+      }
+    val tiebreak: Comparator<OversizedPageDto> =
+      compareBy(String.CASE_INSENSITIVE_ORDER, OversizedPageDto::seriesTitle)
+        .thenBy(String.CASE_INSENSITIVE_ORDER, OversizedPageDto::bookName)
+        .thenBy(OversizedPageDto::pageNumber)
+    val finalComparator = (if (descending) keyComparator.reversed() else keyComparator).then(tiebreak)
+    oversizedPages.sortWith(finalComparator)
 
     val start = (page.pageNumber * page.pageSize).coerceAtMost(oversizedPages.size)
     val end = ((page.pageNumber + 1) * page.pageSize).coerceAtMost(oversizedPages.size)

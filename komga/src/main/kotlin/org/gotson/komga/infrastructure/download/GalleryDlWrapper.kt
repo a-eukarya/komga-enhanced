@@ -37,13 +37,14 @@ class GalleryDlWrapper(
 
   companion object {
     private const val MAX_OUTPUT_SIZE = 512 * 1024
+
+    // JSON output (`gallery-dl -j`) must stay a complete, valid document, so it is
+    // never front-dropped like progress/error streams. Bounded only to avoid OOM on
+    // a runaway feed; a manga with thousands of chapters is well under this.
+    private const val MAX_JSON_OUTPUT_SIZE = 32 * 1024 * 1024
     private val progressRegex = """(\d+)%\s+[\d.]+\s*[KMG]?B\s+[\d.]+\s*[KMG]?B/s""".toRegex()
 
     fun extractMangaDexId(url: String): String? = MangaDexApiClient.extractMangaDexId(url)
-  }
-
-  fun evictPluginConfigCache() {
-    pluginConfigCache = null
   }
 
   private fun getPluginConfig(): Map<String, String?> {
@@ -86,6 +87,13 @@ class GalleryDlWrapper(
     sb.appendLine(line)
   }
 
+  private fun appendJson(
+    sb: StringBuilder,
+    line: String,
+  ) {
+    if (sb.length < MAX_JSON_OUTPUT_SIZE) sb.appendLine(line)
+  }
+
   fun getChaptersForManga(
     mangaId: String,
     language: String? = null,
@@ -95,8 +103,6 @@ class GalleryDlWrapper(
   }
 
   fun getMangaMetadata(mangaId: String): MangaInfo? = mangaDexApiClient.getMangaMetadata(mangaId)
-
-  fun getMangaDexChapterCount(mangaDexId: String): Int? = mangaDexApiClient.getMangaDexChapterCount(mangaDexId, getDefaultLanguage())
 
   fun isInstalled(): Boolean = galleryDlProcess.isInstalled(getGalleryDlPath())
 
@@ -142,7 +148,7 @@ class GalleryDlWrapper(
 
       BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
         reader.lines().forEach { line ->
-          appendBounded(output, line)
+          appendJson(output, line)
           logger.debug { "gallery-dl info: $line" }
         }
       }
@@ -228,7 +234,7 @@ class GalleryDlWrapper(
           .start()
 
       BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-        reader.lines().forEach { line -> appendBounded(output, line) }
+        reader.lines().forEach { line -> appendJson(output, line) }
       }
       BufferedReader(InputStreamReader(process.errorStream)).use { reader ->
         reader.lines().forEach { _ -> }
@@ -253,8 +259,7 @@ class GalleryDlWrapper(
         val chapterUrl = entry[1] as? String ?: return@forEach
         val metadata = entry[2] as? Map<*, *> ?: return@forEach
 
-        val chapterIdNum = metadata["chapter_id"]
-        val chapterId = chapterIdNum?.toString() ?: return@forEach
+        val chapterId = metadata["chapter_id"]?.toString()
         val chapterNum = metadata["chapter"]
         val chapterMinor = metadata["chapter-minor"] as? String ?: metadata["chapter_minor"] as? String ?: ""
         val chapterNumber =
@@ -265,7 +270,7 @@ class GalleryDlWrapper(
             null
           }
 
-        mapping[chapterId] =
+        mapping[chapterUrl] =
           ChapterDownloadInfo(
             chapterId = chapterId,
             chapterNumber = chapterNumber,
@@ -500,18 +505,78 @@ class GalleryDlWrapper(
             emptyMap()
           }
 
-        logger.debug { "Starting bulk download: $url (chapter mapping: ${galleryDlChapterMap.size} chapters)" }
+        if (galleryDlChapterMap.isNotEmpty()) totalChapters = galleryDlChapterMap.size
+
+        // The series isn't scanned yet, so resume from the CBZ files alone. A chapter is done
+        // only if its CBZ carries a <Number> in the source-written ComicInfo.xml (added once
+        // the chapter fully finishes); this keys resume off the metadata, not any filename
+        // convention. Then feed gallery-dl only the missing chapter URLs via -i — which fixes
+        // gaps anywhere in the run, not just an interrupted tail.
+        val cbzFiles =
+          destDir
+            .walkTopDown()
+            .filter { it.isFile && it.extension.lowercase() == "cbz" }
+            .toList()
+        val numberByCbz = cbzFiles.associateWith { comicInfoGenerator.readChapterNumber(it)?.toDoubleOrNull() }
+        val completeNumbers = numberByCbz.values.filterNotNull().toSet()
+        // Re-download the highest complete chapter too ("-1"): it finished right before the
+        // interruption point, so re-fetch it to be safe.
+        val maxComplete = completeNumbers.maxOrNull()
+        val keptComplete = if (maxComplete != null) completeNumbers - maxComplete else completeNumbers
+        cbzFiles
+          .filter { numberByCbz[it] == null || numberByCbz[it] == maxComplete }
+          .forEach { deleteQuietly(it) }
+
+        // Remove leftover chapter image folders from interrupted runs (page images and/or a
+        // half-downloaded ".part" file). Complete chapters have none (keep-files:false), so
+        // any such folder is stale; deleting it forces a clean, full re-download.
+        val leftoverExtensions = setOf("jpg", "jpeg", "png", "webp", "gif", "avif", "bmp", "part")
+        destDir
+          .walkTopDown()
+          .filter { dir -> dir.isDirectory && dir.listFiles()?.any { it.isFile && it.extension.lowercase() in leftoverExtensions } == true }
+          .toList()
+          .forEach { it.deleteRecursively() }
+        if (keptComplete.isNotEmpty()) filesDownloaded.set(keptComplete.size)
+
+        var resumeInputFile: File? = null
+        val effectiveCommand =
+          if (galleryDlChapterMap.isEmpty()) {
+            command
+          } else {
+            val needed = galleryDlChapterMap.values.filter { it.chapterNumber?.toDoubleOrNull() !in keptComplete }
+            val inputFile = File.createTempFile("gallery-dl-resume-", ".txt")
+            inputFile.writeText(needed.joinToString("\n") { it.chapterUrl })
+            resumeInputFile = inputFile
+            logger.debug { "Resume: ${needed.size} chapters to download (${completeNumbers.size} already complete)" }
+            galleryDlProcess
+              .getCommand(gdlPath)
+              .toMutableList()
+              .apply {
+                add("-i")
+                add(inputFile.absolutePath)
+                add("-d")
+                add(destinationPath.toString())
+                add("--config")
+                add(configFile.absolutePath)
+              }
+          }
+
+        logger.debug { "Starting bulk download: $url (${galleryDlChapterMap.size} chapters total, ${completeNumbers.size} complete on disk)" }
         logToDatabase(org.gotson.komga.domain.model.LogLevel.INFO, "Starting download: $url")
 
         val process =
           galleryDlProcess
             .applyEnv(ProcessBuilder(), gdlPath)
-            .command(command)
+            .command(effectiveCommand)
             .directory(File(System.getProperty("user.home")))
             .start()
 
         onProcessStarted(process)
         var lastProgress = 0
+        if (totalChapters > 0) {
+          val done = filesDownloaded.get()
+          onProgress(DownloadProgress(done, totalChapters, done * 100 / totalChapters, "Resuming download"))
+        }
 
         val seenChapterDirs =
           java.util.concurrent.ConcurrentHashMap
@@ -571,6 +636,7 @@ class GalleryDlWrapper(
           stderrThread.join(5000)
           if (stderrThread.isAlive) stderrThread.interrupt()
           deleteQuietly(configFile)
+          resumeInputFile?.let { deleteQuietly(it) }
           throw GalleryDlException("Timeout downloading $url")
         }
         stdoutThread.join(5000)
@@ -580,6 +646,7 @@ class GalleryDlWrapper(
 
         val exitCode = process.exitValue()
         deleteQuietly(configFile)
+        resumeInputFile?.let { deleteQuietly(it) }
 
         if (exitCode != 0) {
           throw GalleryDlException("Download failed with exit code $exitCode: ${errorOutput.toString().trim()}")
@@ -599,69 +666,10 @@ class GalleryDlWrapper(
           allFiles.filter { it.isDirectory && it != destDir && it.listFiles()?.isEmpty() == true }.forEach { deleteQuietly(it) }
         }
 
-        val downloadedCbzFiles =
-          destDir
-            .listFiles()
-            ?.filter { it.isFile && it.extension.lowercase() == "cbz" }
-            ?: emptyList()
-
-        logger.debug { "Found ${downloadedCbzFiles.size} CBZ files, processing metadata" }
-
-        val retryChapters =
-          if (mangaDexId != null) {
-            try {
-              mangaDexApiClient.fetchAllChaptersFromMangaDex(mangaDexId).also {
-                if (it.isNotEmpty()) logger.debug { "Fetched ${it.size} chapters from MangaDex API" }
-              }
-            } catch (e: Exception) {
-              logger.warn(e) { "Failed to fetch chapters from MangaDex API for $mangaDexId" }
-              emptyList()
-            }
-          } else {
-            emptyList()
-          }
-        val chapterMap = retryChapters.associateBy { it.chapterNumber }
-
-        downloadedCbzFiles.forEach { cbzFile ->
-          try {
-            val chapterNum = chapterMatcher.extractChapterNumberFromFilename(cbzFile.name)
-            val matched = chapterMap[chapterNum]
-            if (matched != null) {
-              val chapterInfo =
-                ChapterInfo(
-                  chapterNumber = matched.chapterNumber,
-                  chapterTitle = matched.chapterTitle,
-                  volume = matched.volume,
-                  pages = matched.pages,
-                  scanlationGroup = matched.scanlationGroup,
-                  publishDate = matched.publishDate,
-                  language = matched.language,
-                )
-              addComicInfoToCbzWithChapterInfo(cbzFile.toPath(), mangaInfo, chapterInfo, matched.chapterUrl)
-            } else {
-              val cbzNameNoExt = cbzFile.nameWithoutExtension
-              val galleryDlMatch = galleryDlChapterMap[cbzNameNoExt]
-              if (galleryDlMatch != null) {
-                val chapterInfo =
-                  ChapterInfo(
-                    chapterNumber = galleryDlMatch.chapterNumber,
-                    chapterTitle = galleryDlMatch.chapterTitle,
-                    volume = galleryDlMatch.volume,
-                    pages = galleryDlMatch.pages,
-                    scanlationGroup = galleryDlMatch.scanlationGroup,
-                    publishDate = galleryDlMatch.publishDate,
-                    language = galleryDlMatch.language,
-                  )
-                addComicInfoToCbzWithChapterInfo(cbzFile.toPath(), mangaInfo, chapterInfo, galleryDlMatch.chapterUrl)
-              } else {
-                addComicInfoToCbz(cbzFile.toPath(), mangaInfo)
-              }
-            }
-          } catch (e: Exception) {
-            logger.warn(e) { "Failed to inject ComicInfo.xml into ${cbzFile.name}" }
-          }
-        }
-
+        // The gallery-dl `komga` postprocessor already wrote a correct, source-aware
+        // ComicInfo.xml into each CBZ during download. Komga must NOT re-inject it here:
+        // doing so overwrote the good file and, for non-MangaDex sources, produced a bogus
+        // `mangadex.org/chapter/…` URL. Trust the postprocessor's output.
         chapterMatcher.normalizeDoubleBracketFilenames(destDir)
       } else if (filteredChapters.isEmpty()) {
         logger.debug { "All ${allChapters.size} chapters already downloaded, nothing to do" }
@@ -672,8 +680,8 @@ class GalleryDlWrapper(
         val chapterFailures = loadChapterFailures(failuresFile)
         val currentMangaDexId = extractMangaDexId(url)
 
-        val externalRedirects = filteredChapters.count { it.pages == 0 }
-        totalChapters = filteredChapters.count { it.pages > 0 && (chapterFailures[it.chapterUrl] ?: 0) < 3 }
+        val externalRedirects = filteredChapters.count { it.pages == 0 && it.externalUrl != null }
+        totalChapters = filteredChapters.count { (it.pages > 0 || it.externalUrl == null) && (chapterFailures[it.chapterUrl] ?: 0) < 3 }
         val autoBlacklisted = filteredChapters.size - totalChapters - externalRedirects
         val resumeInfo = if (skippedCount > 0) " (resuming, $skippedCount already done)" else ""
         val externalInfo = if (externalRedirects > 0) " ($externalRedirects external redirects)" else ""
@@ -698,7 +706,7 @@ class GalleryDlWrapper(
 
           val chapterNum = chapter.chapterNumber ?: "${index + 1}"
 
-          if (chapter.pages == 0) {
+          if (chapter.pages == 0 && chapter.externalUrl != null) {
             if (komgaSeriesId != null && !blacklistedChapterRepository.existsByChapterUrl(chapter.chapterUrl)) {
               try {
                 blacklistedChapterRepository.insert(
@@ -975,13 +983,12 @@ class GalleryDlWrapper(
     mangaInfo: MangaInfo,
   ) {
     try {
-      val chapterId = chapterMatcher.extractChapterId(cbzPath)
+      val chapterId = if (mangaInfo.mangaDexId != null) chapterMatcher.extractChapterId(cbzPath) else null
       val chapterInfo =
         if (chapterId != null) {
           logger.debug { "Fetching chapter metadata for ${cbzPath.fileName} (chapter ID: $chapterId)" }
           mangaDexApiClient.fetchChapterMetadata(chapterId)
         } else {
-          logger.warn { "Could not extract chapter ID from ${cbzPath.fileName}, using series metadata only" }
           null
         }
 
@@ -1510,7 +1517,7 @@ class GalleryDlWrapper(
 }
 
 data class ChapterDownloadInfo(
-  val chapterId: String,
+  val chapterId: String?,
   val chapterNumber: String?,
   val chapterTitle: String?,
   val volume: String?,
@@ -1519,6 +1526,7 @@ data class ChapterDownloadInfo(
   val publishDate: String?,
   val language: String?,
   val chapterUrl: String,
+  val externalUrl: String? = null,
 )
 
 data class MangaInfo(

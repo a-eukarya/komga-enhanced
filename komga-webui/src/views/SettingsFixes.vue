@@ -88,6 +88,73 @@
       </v-row>
       <!-- ── END FIX ─────────────────────────────────────────────────────── -->
 
+      <!-- ── Schema-driven fixes (FixRegistry on the backend) ─────────────── -->
+      <v-row v-for="fix in dynamicFixes" :key="fix.id">
+        <v-col cols="12" md="7">
+          <v-card outlined>
+            <v-card-title class="subtitle-1 font-weight-bold">
+              <v-icon left color="warning">{{ fix.icon }}</v-icon>
+              {{ fix.title }}
+            </v-card-title>
+            <v-card-text>
+              <p class="body-2 mb-3">{{ fix.description }}</p>
+              <template v-for="p in fix.params">
+                <v-text-field
+                  v-if="p.type === 'number'"
+                  :key="p.key"
+                  v-model.number="dynamicState[fix.id][p.key]"
+                  :label="p.label"
+                  type="number"
+                  :min="p.min"
+                  :max="p.max"
+                  :hint="p.hint"
+                  persistent-hint
+                  outlined
+                  dense
+                  class="mb-3"
+                />
+                <v-text-field
+                  v-else-if="p.type === 'string'"
+                  :key="p.key"
+                  v-model="dynamicState[fix.id][p.key]"
+                  :label="p.label"
+                  :hint="p.hint"
+                  persistent-hint
+                  outlined
+                  dense
+                  class="mb-3"
+                />
+                <v-checkbox
+                  v-else-if="p.type === 'boolean'"
+                  :key="p.key"
+                  v-model="dynamicState[fix.id][p.key]"
+                  :label="p.label"
+                  :hint="p.hint"
+                  persistent-hint
+                  dense
+                  class="mt-0 mb-1"
+                />
+              </template>
+            </v-card-text>
+            <v-card-actions class="pt-0">
+              <v-btn
+                color="warning"
+                :loading="!!dynamicRunning[fix.id]"
+                :disabled="!!dynamicRunning[fix.id]"
+                @click="runDynamicFix(fix)"
+              >
+                <v-icon left>mdi-play</v-icon>
+                Run
+              </v-btn>
+              <span v-if="dynamicResult[fix.id]" class="caption text--secondary ml-3">
+                {{ dynamicResult[fix.id] }}
+              </span>
+            </v-card-actions>
+          </v-card>
+        </v-col>
+      </v-row>
+      <!-- ── END dynamic fixes ─────────────────────────────────────────────── -->
+
     </v-container>
 
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="4000" top>
@@ -112,6 +179,10 @@ export default {
         result: null,
       },
       polling: false,
+      dynamicFixes: [],
+      dynamicState: {},
+      dynamicRunning: {},
+      dynamicResult: {},
       snackbar: {
         show: false,
         text: '',
@@ -126,6 +197,7 @@ export default {
       this.showSnack('Failed to load libraries: ' + (e.message || e), 'error')
     }
     await this.refreshRepairStatus()
+    await this.loadDynamicFixes()
   },
   beforeDestroy() {
     this.polling = false
@@ -197,6 +269,48 @@ export default {
       this.snackbar.text = text
       this.snackbar.color = color
       this.snackbar.show = true
+    },
+    async loadDynamicFixes() {
+      try {
+        const response = await this.$http.get('/api/v1/maintenance/fixes')
+        this.dynamicFixes = response.data || []
+        const state = {}
+        const running = {}
+        const result = {}
+        for (const fix of this.dynamicFixes) {
+          state[fix.id] = {}
+          running[fix.id] = false
+          result[fix.id] = null
+          for (const p of fix.params || []) {
+            state[fix.id][p.key] = p.default
+          }
+        }
+        this.dynamicState = state
+        this.dynamicRunning = running
+        this.dynamicResult = result
+      } catch (e) {
+        this.dynamicFixes = []
+      }
+    },
+    async runDynamicFix(fix) {
+      this.$set(this.dynamicRunning, fix.id, true)
+      this.$set(this.dynamicResult, fix.id, null)
+      try {
+        const method = (fix.method || 'POST').toLowerCase()
+        const params = this.dynamicState[fix.id] || {}
+        const response = method === 'get'
+          ? await this.$http.get(fix.endpoint, { params })
+          : await this.$http.request({ url: fix.endpoint, method, params })
+        const msg = response.data && response.data.message ? response.data.message : `${fix.title}: done`
+        this.$set(this.dynamicResult, fix.id, msg)
+        this.showSnack(msg, 'success')
+      } catch (e) {
+        const msg = (e && e.response && e.response.data && e.response.data.message) || e.message || 'Unknown error'
+        this.$set(this.dynamicResult, fix.id, `Failed: ${msg}`)
+        this.showSnack(`${fix.title} failed: ${msg}`, 'error')
+      } finally {
+        this.$set(this.dynamicRunning, fix.id, false)
+      }
     },
   },
 }

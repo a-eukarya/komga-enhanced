@@ -165,7 +165,7 @@
         <span class="d-none d-sm-inline text-caption mr-2">Per page:</span>
         <v-select
           v-model="pageSize"
-          :items="[20, 50, 100, 250, 500]"
+          :items="[20, 50, 100, 150]"
           dense
           hide-details
           style="max-width: 90px"
@@ -190,13 +190,14 @@
           class="ma-2 oversized-card"
           :style="{
             width: $vuetify.breakpoint.xsOnly ? '100%' : '480px',
+            height: $vuetify.breakpoint.xsOnly ? 'auto' : '360px',
             cursor: 'pointer',
             border: isSelected(item) ? '2px solid var(--v-primary-base)' : '2px solid transparent',
           }"
           :class="isSelected(item) ? 'elevation-6' : 'elevation-1'"
           @click="onCardClick(item, idx, $event)">
-            <v-row no-gutters>
-              <v-col cols="auto" class="pa-2" style="position: relative">
+            <v-row no-gutters style="flex-wrap: nowrap; height: 100%">
+              <v-col cols="auto" class="pa-2" style="position: relative; flex: 0 0 auto">
                 <v-checkbox
                   :input-value="isSelected(item)"
                   @click.stop="onCheckboxClick(item, idx, $event)"
@@ -221,7 +222,7 @@
                   </template>
                 </v-img>
               </v-col>
-              <v-col class="pa-3 d-flex flex-column">
+              <v-col class="pa-3 d-flex flex-column" style="min-width: 0; overflow: hidden">
                 <div class="text-caption grey--text">Series</div>
                 <router-link
                   :to="{name: 'browse-series', params: {seriesId: item.seriesId}}"
@@ -471,7 +472,7 @@ export default Vue.extend({
       selectedPages: [] as (OversizedPageDto & {rowKey: string})[],
       totalElements: 0,
       page: 1,
-      pageSize: this.$store?.state?.persistedState?.dataTablePageSize || 20,
+      pageSize: Math.min(this.$store?.state?.persistedState?.dataTablePageSize || 20, 150),
       sortKey: 'ratio',
       sortDesc: true,
       loading: true,

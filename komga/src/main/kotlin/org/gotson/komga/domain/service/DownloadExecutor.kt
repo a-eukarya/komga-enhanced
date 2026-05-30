@@ -268,6 +268,28 @@ class DownloadExecutor(
     logger.info { "Cancelled download: $downloadId" }
   }
 
+  fun pauseDownload(downloadId: String) {
+    val download =
+      downloadQueueRepository.findByIdOrNull(downloadId)
+        ?: throw IllegalArgumentException("Download not found: $downloadId")
+
+    downloadQueueRepository.update(
+      download.copy(
+        status = DownloadStatus.PAUSED,
+        lastModifiedDate = LocalDateTime.now(),
+      ),
+    )
+
+    cancelledIds.add(downloadId)
+    activeDownloads.remove(downloadId)?.let { active ->
+      active.process?.let { proc ->
+        logger.info { "Killing gallery-dl subprocess for paused download $downloadId (pid=${proc.pid()})" }
+        proc.destroyForcibly()
+      }
+    }
+    logger.info { "Paused download: $downloadId (resume re-queues and downloads only the missing chapters)" }
+  }
+
   fun retryDownload(downloadId: String) {
     val download =
       downloadQueueRepository.findByIdOrNull(downloadId)

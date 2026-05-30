@@ -102,6 +102,28 @@ class MangaDexSubscriptionSyncer(
     startIfEnabled()
   }
 
+  fun forceResyncFeed(lookbackDays: Int = 7): ResyncResult {
+    val plugin = pluginRepository.findByIdOrNull(pluginId)
+    if (plugin == null || !plugin.enabled) {
+      return ResyncResult(false, "MangaDex Subscription plugin is not enabled")
+    }
+    val rewoundTime =
+      Instant
+        .now()
+        .minusSeconds(lookbackDays * 86400L)
+        .atOffset(ZoneOffset.UTC)
+        .format(mangaDexDateFormat)
+    saveConfigValue("last_check_time", rewoundTime)
+    logger.info { "Force resync triggered: rewound last_check_time to $rewoundTime ($lookbackDays days)" }
+    runFeedCheck()
+    return ResyncResult(true, "Resync completed (window: $lookbackDays days)")
+  }
+
+  data class ResyncResult(
+    val success: Boolean,
+    val message: String,
+  )
+
   fun syncFollowsToMangaDex(libraryId: String): SyncResult {
     val library =
       libraryRepository.findByIdOrNull(libraryId)
@@ -418,9 +440,6 @@ class MangaDexSubscriptionSyncer(
 
         if (isChapterKnown(mangaId, chapterId, chapterUrl, seriesCache, knownIdsByManga, blacklistedIdsByManga)) continue
 
-        val mangaUrl = "https://mangadex.org/title/$mangaId"
-        if (downloadExecutor.isUrlAlreadyQueued(mangaUrl)) continue
-
         newChaptersByManga
           .getOrPut(mangaId) { mutableListOf() }
           .add(
@@ -518,6 +537,73 @@ class MangaDexSubscriptionSyncer(
         .header("Authorization", "Bearer $token")
         .GET()
         .timeout(Duration.ofSeconds(30))
+        .build()
+    return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+  }
+
+  fun followMangaOnAccount(mangaId: String): FollowToggleResult {
+    val config = loadConfig()
+    if (!hasRequiredCredentials(config)) {
+      return FollowToggleResult(false, "MangaDex credentials not configured")
+    }
+    val token = getValidToken(config)
+    val response = apiPost("$apiBase/manga/$mangaId/follow", token, null)
+    if (response.statusCode() in 200..204) {
+      return FollowToggleResult(true, "Followed on MangaDex")
+    }
+    return FollowToggleResult(false, "MangaDex returned HTTP ${response.statusCode()}")
+  }
+
+  fun unfollowMangaOnAccount(mangaId: String): FollowToggleResult {
+    val config = loadConfig()
+    if (!hasRequiredCredentials(config)) {
+      return FollowToggleResult(false, "MangaDex credentials not configured")
+    }
+    val token = getValidToken(config)
+    val response = apiDelete("$apiBase/manga/$mangaId/follow", token)
+    if (response.statusCode() in 200..204) {
+      return FollowToggleResult(true, "Unfollowed on MangaDex")
+    }
+    return FollowToggleResult(false, "MangaDex returned HTTP ${response.statusCode()}")
+  }
+
+  @Suppress("UNCHECKED_CAST")
+  fun getFollowedMangaIdsFromAccount(): Set<String> {
+    val config = loadConfig()
+    if (!hasRequiredCredentials(config)) return emptySet()
+    val token = getValidToken(config)
+    val ids = mutableSetOf<String>()
+    var offset = 0
+    val limit = 100
+    while (true) {
+      val response = apiGet("$apiBase/user/follows/manga?limit=$limit&offset=$offset", token)
+      if (response.statusCode() != 200) break
+      val data: Map<String, Any> = objectMapper.readValue(response.body())
+      val list = data["data"] as? List<Map<String, Any>> ?: emptyList()
+      val total = (data["total"] as? Number)?.toInt() ?: 0
+      list.forEach { manga -> (manga["id"] as? String)?.let { ids.add(it.lowercase()) } }
+      offset += list.size
+      if (offset >= total || list.isEmpty()) break
+    }
+    return ids
+  }
+
+  data class FollowToggleResult(
+    val success: Boolean,
+    val message: String,
+  )
+
+  private fun apiDelete(
+    url: String,
+    token: String,
+  ): HttpResponse<String> {
+    val request =
+      HttpRequest
+        .newBuilder()
+        .uri(URI.create(url))
+        .header("Authorization", "Bearer $token")
+        .timeout(Duration.ofSeconds(30))
+        .DELETE()
         .build()
     return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
   }

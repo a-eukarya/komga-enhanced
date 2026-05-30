@@ -6,6 +6,178 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## [0.1.4.4] - 2026-05-30
+
+### Fix: MangaDex Subscription feed — new chapters silently skipped for any manga that was ever queued
+
+`MangaDexSubscriptionSyncer.checkFeed` was guarding every chapter with `downloadExecutor.isUrlAlreadyQueued(mangaUrl)`, which treats `COMPLETED` queue entries as "still queued". Any manga that ever produced a queue row (e.g. an earlier 0-files completion from an empty MangaDex API, or a one-off queue via the search dialog) was permanently invisible to the feed — `runFeedCheck` reported "no new chapters" while real updates piled up, fixable only by manually clearing the COMPLETED row. The guard is removed in `checkFeed`: `isChapterKnown` already blocks duplicates via the chapter-URL DB, and `createDownload` is the right action when the API reports a new chapter for a followed series, regardless of any historical queue row for the manga URL.
+
+### Fix: MangaDex Listing API stale `pages: 0` auto-blacklisted real chapters
+
+For some chapters MangaDex's `/chapter` and `/manga/{id}/feed` listings return `pages: 0` while `externalUrl` is still `null` — the listing cache is stale, but `/at-home/server/{chapterId}` actually serves the real pages. Komga's downloader treated every `pages == 0` chapter as an external-publisher redirect and auto-blacklisted it forever, so those chapters could never be re-downloaded even after MangaDex's cache caught up. gallery-dl's own check is `if external_url and not count: abort` — only when both are set is it a real redirect. `MangaDexApiClient` now extracts `externalUrl` into `ChapterDownloadInfo` and `GalleryDlWrapper` uses the same precise condition:
+
+- `externalRedirects = filteredChapters.count { it.pages == 0 && it.externalUrl != null }` (statistic only)
+- `totalChapters = filteredChapters.count { (it.pages > 0 || it.externalUrl == null) && fails < 3 }` — stale-cache chapters are counted as downloadable
+- Auto-blacklist is gated by `chapter.pages == 0 && chapter.externalUrl != null`
+
+Stale-cache chapters fall through to the normal download path. gallery-dl follows the chapter URL, sees `external_url=null`, hits AtHome, and writes the real pages. Real J-Novel-style redirects (`externalUrl != null && pages == 0`) are still auto-blacklisted; ChapterChecker, the Subscription sync, ChapterUrlImporter, the `downloadable-check` heuristic and the ComicInfo generator all keep their existing semantics — they don't gate on `pages == 0`. After repeated AtHome failures the existing `chapterFailures` counter (3 strikes) takes over for chapters that really have no pages anywhere.
+
+**Example:** `https://mangadex.org/title/d2d22b38-4b3f-4ffb-9387-d18f870d5a91` — chapters 13 (EN) and 17 (EN) show `pages: 0, externalUrl: null` in the listing, but `/at-home/server/2e42e9fd-…` returns 24 image filenames and `/at-home/server/9000d89b-…` returns 36. Before this change both were auto-blacklisted on first sync; after the change they download normally.
+
+### Added: Force Resync Feed action (schema-driven fix card)
+
+A new `FixRegistry` (`infrastructure/maintenance/`) defines maintenance actions as JSON-serialisable schemas (`id`, `title`, `description`, `icon`, `endpoint`, `method`, typed `params[]`) with a per-fix `isEnabled` predicate so each entry hides when its underlying plugin/feature is disabled. `GET /api/v1/maintenance/fixes` returns the visible list, and the existing `SettingsFixes.vue` (`/settings/fixes`) renders one card per fix dynamically — typed inputs (`number`/`string`/`boolean`) and a Run button are generated automatically; the hand-written *Re-inject ComicInfo.xml* card on the same page stays in place because it has its own polling/status flow. Adding a new fix later means one `Registration` block in `FixRegistry` plus the backend endpoint; no Vue changes needed.
+
+First registered fix: **MangaDex Subscription — Force Resync** (`POST /api/v1/downloads/mangadex-subscription/force-resync?lookbackDays=N`, default 7). Rewinds `last_check_time` by N days and runs `runFeedCheck()` immediately, so chapters that were silently dropped by the old `isUrlAlreadyQueued` guard above (or by a stuck `last_check_time` after a long restart gap) get picked up without waiting for the next scheduled tick.
+
+### Added: MangaDex account follow toggle + filter in the advanced MangaDex search
+
+The advanced MangaDex search under */downloads* already had a follow.txt toggle per card; it now also has an explicit *MangaDex* button (visible when the MangaDex Subscription plugin is enabled) that follows/unfollows the title on the user's MangaDex account via `POST` / `DELETE /api/v1/downloads/mangadex/follows/{mangaId}`. The existing follow.txt button was relabeled to `follow.txt` to make the two distinct.
+
+A second filter toggle **Hide titles already on MangaDex follow list** complements the existing *Hide titles already in any follow.txt*. It uses `GET /api/v1/downloads/mangadex/follows` to seed the local set once on mount (paginated server-side, capped at MangaDex's `limit=100`/page) and is part of the saved filter defaults (`m` field).
+
+### Fix: AutoMetadataMatcher.match — type mismatch caused by positional argument
+
+`match(series, onlyEnabled)` forwarded `onlyEnabled: Boolean` into `scan(series, searchTitle: String = series.name, onlyEnabled: Boolean = true)`'s positional `searchTitle` slot, causing a `Boolean` / `String` type mismatch in `compileKotlin`. Now uses the named argument `scan(series, onlyEnabled = onlyEnabled)`.
+
+### Added: Plugin class-loader isolation — only the SPI is reachable from a plugin JAR
+
+`PluginLoader` previously gave every plugin's `URLClassLoader` Komga's own classloader as parent, so a plugin could `import org.gotson.komga.domain.service.SeriesLifecycle` (or any other internal) and reach into the host. The parent is now a `SpiOnlyClassLoader` that whitelists `org.gotson.komga.infrastructure.plugin.api.*`, `java.*`, `javax.*`, `kotlin.*`, `kotlinx.*`, `com.fasterxml.jackson.*` and throws `ClassNotFoundException("Plugin denied access to '$name' — class-loader isolation. …")` for everything else. The four built-in plugins (`anilist-plugin`, `kitsu-plugin`, `metron-plugin`, `plugin-template`) already only touch the allowed packages, so nothing breaks; an external plugin that needs OkHttp, SQLite-JDBC etc. keeps working as long as it bundles those into its JAR (the plugin's own `URLClassLoader` serves them after the parent rejects). `PLUGINS.md`, the project `README.md` and `plugins/plugin-template/README.md` are updated with a "Security model" section that calls out the explicit limits: this is **class-loader isolation, not a sandbox** — `java.lang.reflect`, `java.io.File` and `java.net.http` are intentionally allowed, the SPI itself is the trust boundary, and a malicious external JAR still has Komga-process-level filesystem and network rights. Real isolation (SecurityManager / JPMS / out-of-process plugins) is explicitly out of scope.
+
+### Fix: History page (`/history`) — browser lagged for seconds while titles popped in
+
+`HistoryView.loadData()` fired one `getOneSeries` + one `getBook` per unique id in the visible page (up to 20 + 20 = 40 fire-and-forget HTTP calls) and `.push()`'d each result onto an array. Each push re-rendered the whole data table, and the per-cell `getSeries(id)` / `getBook(id)` lookups were `Array.find(x => x.id === id)` (O(n)) called four times per row × 20 rows × 40 push-cycles ≈ 64 000 linear scans. Worse, `loading = false` ran straight after `getAll()`, before any series/book fetch resolved — so the spinner cleared while titles popped in one by one. Now: caches are `Record<string, …>` (O(1) lookup), the per-page fetches run through one `Promise.all(Promise.allSettled(…))` and write the cache with a single object spread (2 reactive updates total instead of 40), and `loading = false` only flips after every fetch settles. Template / method signatures unchanged.
+
+### Modified Files
+| File | Path |
+|------|------|
+| `MangaDexSubscriptionSyncer.kt` | `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/MangaDexSubscriptionSyncer.kt` |
+| `MangaDexApiClient.kt` | `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/MangaDexApiClient.kt` |
+| `GalleryDlWrapper.kt` | `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` |
+| `DownloadController.kt` | `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/DownloadController.kt` |
+| `AutoMetadataMatcher.kt` | `komga/src/main/kotlin/org/gotson/komga/infrastructure/automatch/AutoMetadataMatcher.kt` |
+| `PluginLoader.kt` | `komga/src/main/kotlin/org/gotson/komga/infrastructure/plugin/PluginLoader.kt` |
+| `PLUGINS.md` | `PLUGINS.md` |
+| `README.md` | `README.md` |
+| `plugin-template/README.md` | `plugins/plugin-template/README.md` |
+| `SettingsFixes.vue` | `komga-webui/src/views/SettingsFixes.vue` |
+| `DownloadDashboard.vue` | `komga-webui/src/views/DownloadDashboard.vue` |
+| `HistoryView.vue` | `komga-webui/src/views/HistoryView.vue` |
+
+### New Files
+| File | Path |
+|------|------|
+| `FixRegistry.kt` | `komga/src/main/kotlin/org/gotson/komga/infrastructure/maintenance/FixRegistry.kt` |
+| `MaintenanceController.kt` | `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/MaintenanceController.kt` |
+
+### Fix: Duplicate pages (unknown) — unresponsive when stepping through quickly
+
+Acting on a single card (ignore / manual delete / auto delete) reloaded the entire page via `loadData()`, which re-fetched every remaining thumbnail and, combined with an index-based `v-for` key, forced Vue to re-render and re-download all visible cover images. Stepping through duplicates quickly therefore stalled after the first action. The card now removes only the acted-upon hash from the local list (a full reload happens only when the page empties out) and the `v-for` key is the stable `element.hash`, so untouched thumbnails are no longer re-fetched.
+
+### Fix: MangaDex search — client-side filters produced sparse pages
+
+With *Hide titles already in follow.txt* or *Only downloadable* enabled, filtering ran **after** a 24-result page was fetched while pagination still used MangaDex's unfiltered `total`. A search that yielded 8 visible results was split across e.g. two near-empty pages of 4 instead of one full page. Search now fetches additional batches per page until `searchPageSize` filtered results are collected (or the result set is exhausted), tracking the raw MangaDex offset per page for cursor-based pagination (`searchPageRawStart` / `searchKnownPages`). When no result-reducing filter is active the original deterministic offset pagination is kept unchanged. Bounded by `MAX_BATCHES` per page and the MangaDex `offset+limit ≤ 10000` cap.
+
+### Fix: gallery-dl `-j` output truncated for mangas with many chapters
+
+`getChapterInfo` and `fetchGalleryDlChapterMapping` captured the `gallery-dl -j` output with `appendBounded`, the helper used for progress/error streams — which, past a 512 KB cap, **drops the front half of the buffer**. For a title with hundreds of chapters the dumped JSON exceeded that cap, so the captured string began mid-document and Jackson failed with `MismatchedInputException`. The result was lost metadata (title/genres) and no chapter mapping — and, since the chapter count came from this parse, no progress total in the WebUI for big non-MangaDex series (smaller listings like mangahere stayed under the cap). JSON output now uses a dedicated `appendJson` helper that never front-drops (bounded only by a 32 MB OOM guard); progress/error streams keep the old tail-bounded behaviour.
+
+### Fix: non-MangaDex download — slow resume, scattered gaps, leftover folders
+
+Resuming a large non-MangaDex series re-visited every already-done chapter (`gallery-dl --download-archive` only skips re-downloading *images*, and only after opening each chapter page — ~1–2 s each), downloading nothing but taking many minutes, while the progress counter restarted at 0. Broken/partial chapters could also sit anywhere in the run and a range-based resume never went back for them. Komga can't use the DB here (an interrupted series isn't scanned yet), so resume now works purely from the **CBZ files on disk**:
+
+- A chapter is *done* only if its CBZ carries a chapter `<Number>` in the **source-written ComicInfo.xml** (the gallery-dl `komga` postprocessor adds it once the chapter fully finishes). Keying resume off this metadata — not the CBZ filename — means a new site needs no Komga change (no per-site naming entry); broken/partial CBZs are detected and deleted, and leftover chapter image folders (stray page images or a half-downloaded `.part`) are removed too, forcing a clean re-download.
+- Komga feeds gallery-dl **only the still-missing chapter URLs** via `-i`, fixing gaps **anywhere** in the run without re-visiting completed chapters. The highest complete chapter is re-downloaded as well, so a chapter that was finishing at the interruption point is never left half-done. The progress counter is seeded from the done-CBZ count.
+- If the chapter list can't be enumerated, it falls back to the whole-manga bulk command.
+
+### Fix: bogus `mangadex.org` URL in ComicInfo of non-MangaDex chapters; downloads stuck at 100 %
+
+After download, Komga **re-injected** ComicInfo over the correct file the gallery-dl `komga` postprocessor had already written. Its chapter lookup was keyed by `chapter_id` (`chapter-648`) while the files are named `c648`, so every CBZ fell through to a MangaDex lookup that hardcoded `<Web>https://mangadex.org/chapter/…</Web>` even for non-MangaDex sources (manhuaplus → `…/chapter/c`) and fired hundreds of MangaDex API calls (404s) that stalled the download at 100 % so it never reached `COMPLETED`/scan. Komga's redundant injection is removed — it now trusts the postprocessor's ComicInfo. (The companion `gallery-dl-komga` fork now writes the real chapter URL into `<Web>` and the chapter release date for all sites, not just MangaDex.)
+
+### Improved: Duplicate pages — instant page switching
+
+Unknown-duplicate thumbnails were regenerated from the archive on disk on **every** request (unlike book posters, which are stored in the DB), so paging through them on an HDD took several seconds per page even after a browser-only prefetch. Three changes make switching near-instant:
+
+- **Server-side cache** (`PageHashLifecycle.getPage`): the generated (optionally resized) page bytes are cached in a Caffeine cache keyed by `hash|resize` (max 500 entries, 30 min after access). The page image for a hash is immutable, so this is always safe. A prefetch now warms this cache; the real display request hits it without touching disk.
+- **`Cache-Control: private, max-age=7d`** on the `unknown/{hash}/thumbnail` endpoint, so the browser also keeps prefetched images and revisiting a page costs no request at all.
+- **Prefetch keeps image references** (`prefetchImages`, a frozen array): `new Image()` loads are no longer garbage-collected mid-flight, so the prefetch reliably completes while you view the current page.
+
+### Improved: MangaDex advanced search — persisted preferences
+
+- **Sort by + Direction are now part of "Save as default"** — `searchOrder` / `searchOrderDir` are included in the saved filter payload (`o` / `od`) and restored on load, and changing either now marks the defaults dirty.
+- **Target library is remembered** — the selected target library is stored in `localStorage` (`komga.fork.mangadexsearch.targetlibrary`) and restored on next visit (falls back to the first library if the stored one no longer exists).
+
+### Improved: Smaller jar — drop source maps
+
+`productionSourceMap: false` in the webui build stops bundling ~15 MB of `.js.map` source maps into `BOOT-INF/classes/public/js/` of the production jar. Source maps only help when debugging minified JS in the browser; they are not needed for a self-hosted server.
+
+| Modified File | Change |
+|---------------|--------|
+| `komga-webui/.../views/DuplicatePagesUnknown.vue` | Remove acted hash locally instead of full reload; stable `element.hash` `v-for` key; prefetch next page's thumbnails (refs retained to avoid GC) |
+| `komga-webui/.../components/PageHashUnknownCard.vue` | Emit acted hash on `created` so the parent can drop just that card |
+| `domain/service/PageHashLifecycle.kt` | Caffeine cache for generated page thumbnails (keyed by `hash\|resize`) so prefetch + display don't re-read from disk |
+| `interfaces/api/rest/PageHashController.kt` | `Cache-Control: private, max-age=7d` on the unknown-thumbnail endpoint |
+| `infrastructure/download/GalleryDlWrapper.kt` | `appendJson` (no front-drop) for `-j` output; non-MangaDex resume from on-disk CBZs (done = chapter `<Number>` in the source-written ComicInfo, **not** the filename) — deletes broken CBZs + leftover `.part`/image folders, re-downloads only the missing chapters (plus the highest complete one) via `-i`, progress seeded from done count; **removed** the post-download ComicInfo re-injection that overwrote the postprocessor's file with a bogus mangadex URL |
+| `infrastructure/download/ComicInfoGenerator.kt` | `readChapterNumber` — reads `<Number>` from a CBZ's ComicInfo so resume keys off metadata, not the filename |
+| `komga-webui/.../views/DownloadDashboard.vue` | Fetch-to-fill cursor pagination when result-reducing filters are active; sort + direction saved in defaults; target library persisted in localStorage |
+| `komga-webui/vue.config.js` | `productionSourceMap: false` — stop bundling ~15 MB of source maps |
+
+### Fix: Auto Metadata Match ran even when disabled
+
+`AutoMetadataMatcher.isEnabled()` read a `PLUGIN_CONFIG` key (`auto-metadata.enabled`) that the Plugin Manager toggle never writes — the toggle sets `PLUGIN.enabled`. Disabling the plugin in the UI therefore had no effect and new-series auto-match kept running. It now reads the real plugin state via `pluginRepository.findByIdOrNull(...)?.enabled`, consistent with the scrobblers and the subscription syncer.
+
+### Cleanup: dead code + orphan DB tables removed
+
+A full audit of the fork code (every private helper, model class, DTO and migration table cross-checked for real callers) removed unused artefacts:
+
+- Dead functions `getMangaDexChapterCount` (wrapper + impl) and `evictPluginConfigCache` — zero callers.
+- Dead model classes `UpdateCheck`, `UserBlacklist`, `BlacklistType` — never instantiated (unrelated to the active chapter-blacklist `BlacklistedChapter`).
+- Orphan tables `UPDATE_CHECK`, `USER_BLACKLIST`, `PLUGIN_PERMISSION` — created by the original plugin_system migration, never read/written by any DAO.
+- Stray `stale.yml.bak` backup file.
+
+| Modified File | Change |
+|---------------|--------|
+| `infrastructure/automatch/AutoMetadataMatcher.kt` | `isEnabled()` reads `PLUGIN.enabled` (via `pluginRepository`) instead of a stale `PLUGIN_CONFIG` key |
+| `infrastructure/download/GalleryDlWrapper.kt` | Removed dead `getMangaDexChapterCount` wrapper + `evictPluginConfigCache` |
+| `infrastructure/download/MangaDexApiClient.kt` | Removed dead `getMangaDexChapterCount` implementation |
+| `domain/model/DownloadQueue.kt` | Removed never-instantiated `UpdateCheck`, `UserBlacklist`, `BlacklistType` |
+| `db/migration/fork/sqlite/V20260529000000__drop_orphan_plugin_tables.sql` | New — drops orphan `UPDATE_CHECK`, `USER_BLACKLIST`, `PLUGIN_PERMISSION` |
+
+### Fix: Follow-list check silently dropped non-MangaDex URLs
+
+The periodic follow.txt scan (`ChapterChecker`) bailed out on any non-MangaDex URL with "Not a MangaDex URL" and never queued it, so manhuaplus/mangahere/… entries were silently ignored — contradicting the README ("other sites use gallery-dl"). Non-MangaDex URLs are now queued for download; the download resume (which keys off the on-disk CBZ `<Number>`) re-downloads only the missing chapters, so a fully-downloaded series loads nothing.
+
+A reliable up-front "already have it?" check is **not** possible for these sites: they have no stable identifier — the URL domain changes (`mangahere.cc` → `.com`) and titles change for fresh releases — so neither URL nor title reliably maps a follow.txt entry back to a local series. The on-disk CBZ `<Number>` (used by the resume) is the single source of truth, so the checker queues unconditionally and lets the resume decide what (if anything) to download.
+
+Separately, `fetchGalleryDlChapterMapping` (used by the download **resume**) is now keyed by the always-present, always-unique `chapterUrl` with `chapter_id` optional (`ChapterDownloadInfo.chapterId` nullable) — `chapter_id` only exists in MangaDex/Madara listings, so the resume now resolves the chapter list for every gallery-dl source instead of only Madara-based ones.
+
+### Fix: "new chapters" endpoint returned 0 for non-MangaDex series
+
+`GET /series/{id}/new-chapters` extracted a MangaDex ID and returned `availableCount=0` for anything else. It now branches on `mangaId` and uses the same gallery-dl mapping for non-MangaDex series.
+
+### Fix: Pause button returned HTTP 400
+
+`DownloadController.performAction` had no `"pause"` case, so the WebUI's pause button (which posts `{action:"pause"}`) got a 400. Added `pauseDownload` to `DownloadExecutor` — it kills the running gallery-dl subprocess and sets status `PAUSED`; `resume` re-queues and (via the on-disk resume logic) downloads only the missing chapters.
+
+| Modified File | Change |
+|---------------|--------|
+| `domain/service/ChapterChecker.kt` | `checkNonMangaDexUrl` — queues non-MangaDex follow.txt URLs unconditionally (no stable identifier for a reliable pre-check; the on-disk resume handles dedup) |
+| `interfaces/api/rest/ChapterUrlController.kt` | `getNewChapters` branches on `mangaId`; non-MangaDex series use the gallery-dl mapping |
+| `domain/service/DownloadExecutor.kt` | New `pauseDownload` (kill subprocess + status `PAUSED`) |
+| `interfaces/api/rest/DownloadController.kt` | `performAction` handles `"pause"` |
+| `infrastructure/download/GalleryDlWrapper.kt` | `fetchGalleryDlChapterMapping` keyed by `chapterUrl` (no longer requires `chapter_id`); `ChapterDownloadInfo.chapterId` nullable — works for every gallery-dl source |
+
+### Fix: Auto Metadata Match searched by folder name instead of title
+
+`AutoMetadataMatcher.scan` searched providers with `series.name` — the folder name. With `folder_naming: uuid` the folder is a UUID string, so the provider search ran against the UUID and never matched. It now searches with the series' metadata title (`SeriesMetadata.title`, populated from the ComicInfo `<Series>` even for UUID folders) and falls back to `series.name` only when the title is blank.
+
+| Modified File | Change |
+|---------------|--------|
+| `infrastructure/automatch/AutoMetadataMatcher.kt` | `scan` takes a `searchTitle` param (default `series.name`); provider search + title scoring use it |
+| `infrastructure/automatch/AutoMetadataApplier.kt` | passes `searchTitle = meta.title ?: series.name` to `scan` |
+
+---
+
 ## [0.1.4.3] - 2026-05-27
 
 ### New: gallery-dl-komga fork + komga postprocessor

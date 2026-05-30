@@ -8,6 +8,7 @@ import org.gotson.komga.domain.model.ChapterUrl
 import org.gotson.komga.domain.model.ChapterUrlBatchCheckResult
 import org.gotson.komga.domain.model.ChapterUrlCheckResult
 import org.gotson.komga.domain.persistence.ChapterUrlRepository
+import org.gotson.komga.infrastructure.download.GalleryDlWrapper
 import org.gotson.komga.infrastructure.download.MangaDexApiClient
 import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType
@@ -37,6 +38,7 @@ private val logger = KotlinLogging.logger {}
 class ChapterUrlController(
   private val chapterUrlRepository: ChapterUrlRepository,
   private val mangaDexApiClient: MangaDexApiClient,
+  private val galleryDlWrapper: GalleryDlWrapper,
 ) {
   /**
    * Check if a single URL has been downloaded.
@@ -153,33 +155,25 @@ class ChapterUrlController(
   ): NewChaptersResponse {
     logger.info { "Calculating new chapters for series $seriesId from $mangaUrl" }
 
-    // Extract MangaDex ID
     val mangaId =
       MangaDexApiClient.extractMangaDexId(mangaUrl)
         ?: if (mangaUrl.matches(Regex("[a-f0-9-]{36}"))) mangaUrl else null
 
-    if (mangaId == null) {
-      logger.warn { "Could not extract manga ID from URL: $mangaUrl" }
-      return NewChaptersResponse(
-        seriesId = seriesId,
-        mangaId = "",
-        availableCount = 0,
-        downloadedCount = 0,
-        newCount = 0,
-        newChapters = emptyList(),
-      )
-    }
-
-    val availableChapters = mangaDexApiClient.getChaptersForManga(mangaId, lang)
-    logger.debug { "Found ${availableChapters.size} chapters on MangaDex" }
-
-    val downloadedUrls = chapterUrlRepository.findUrlsBySeriesIdAndLang(seriesId, lang).toSet()
-    logger.debug { "Found ${downloadedUrls.size} downloaded chapters in database" }
-
-    val newChapters =
-      availableChapters.filter { chapter ->
-        chapter.chapterUrl !in downloadedUrls
+    val availableChapters =
+      if (mangaId != null) {
+        mangaDexApiClient.getChaptersForManga(mangaId, lang)
+      } else {
+        galleryDlWrapper.fetchGalleryDlChapterMapping(mangaUrl).values.toList()
       }
+
+    val downloadedUrls =
+      if (mangaId != null) {
+        chapterUrlRepository.findUrlsBySeriesIdAndLang(seriesId, lang).toSet()
+      } else {
+        chapterUrlRepository.findUrlsBySeriesId(seriesId).toSet()
+      }
+
+    val newChapters = availableChapters.filter { it.chapterUrl !in downloadedUrls }
 
     logger.info {
       "New chapters calculation: ${availableChapters.size} available, " +
@@ -188,7 +182,7 @@ class ChapterUrlController(
 
     return NewChaptersResponse(
       seriesId = seriesId,
-      mangaId = mangaId,
+      mangaId = mangaId ?: "",
       availableCount = availableChapters.size,
       downloadedCount = downloadedUrls.size,
       newCount = newChapters.size,

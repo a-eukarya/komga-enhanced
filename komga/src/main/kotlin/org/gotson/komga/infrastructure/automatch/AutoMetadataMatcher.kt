@@ -66,11 +66,7 @@ class AutoMetadataMatcher(
 
   private fun fullPluginId(short: String): String = if (short.endsWith("-metadata")) short else "$short-metadata"
 
-  fun isEnabled(): Boolean =
-    pluginConfigRepository
-      .findByPluginIdAndKey(AUTO_PLUGIN_ID, "enabled")
-      ?.configValue
-      ?.equals("true", ignoreCase = true) ?: false
+  fun isEnabled(): Boolean = pluginRepository.findByIdOrNull(AUTO_PLUGIN_ID)?.enabled == true
 
   fun providerPriority(): List<String> {
     val csv =
@@ -121,6 +117,7 @@ class AutoMetadataMatcher(
    */
   fun scan(
     series: Series,
+    searchTitle: String = series.name,
     onlyEnabled: Boolean = true,
   ): AutomatchScanResult {
     val primaryThreshold = minScore()
@@ -150,7 +147,7 @@ class AutoMetadataMatcher(
 
       val results =
         try {
-          provider.search(series.name)
+          provider.search(searchTitle)
         } catch (e: Exception) {
           logger.warn(e) { "Auto-match: search failed on '$short' for series='${series.name}'" }
           emptyList()
@@ -159,7 +156,7 @@ class AutoMetadataMatcher(
 
       var best: Pair<MetadataSearchResult, Double>? = null
       for (r in results) {
-        val s = TitleNormalizer.score(series.name, r.title)
+        val s = TitleNormalizer.score(searchTitle, r.title)
         if (best == null || s > best.second) best = r to s
         if (s == 1.0) break
       }
@@ -200,5 +197,5 @@ class AutoMetadataMatcher(
   fun match(
     series: Series,
     onlyEnabled: Boolean = true,
-  ): MatchResult? = scan(series, onlyEnabled).primary
+  ): MatchResult? = scan(series, onlyEnabled = onlyEnabled).primary
 }

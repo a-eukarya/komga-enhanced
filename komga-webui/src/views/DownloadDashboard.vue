@@ -237,6 +237,17 @@
                         />
                       </v-col>
                       <v-col cols="12" md="6" class="d-flex align-center">
+                        <v-switch
+                          v-model="filterHideMangaDexFollowed"
+                          label="Hide titles already on MangaDex follow list"
+                          hint="Needs the MangaDex Subscription plugin (uses its credentials)."
+                          persistent-hint
+                          dense
+                          class="mt-0"
+                          :disabled="!mangaDexPluginEnabled"
+                        />
+                      </v-col>
+                      <v-col cols="12" md="6" class="d-flex align-center">
                         <v-select
                           v-model="searchOrder"
                           :items="sortOptions"
@@ -316,7 +327,18 @@
                         @click="toggleFollow(manga)"
                       >
                         <v-icon x-small left>{{ isFollowed(manga) ? 'mdi-check' : 'mdi-playlist-plus' }}</v-icon>
-                        {{ isFollowed(manga) ? 'Following' : 'Follow' }}
+                        follow.txt
+                      </v-btn>
+                      <v-btn
+                        v-if="mangaDexPluginEnabled"
+                        x-small block depressed outlined
+                        class="mt-1 mx-0"
+                        :color="isMangaDexFollowed(manga) ? 'success' : (mangaDexFollowError[manga.externalId] ? 'error' : '')"
+                        :loading="!!mangaDexFollowBusy[manga.externalId]"
+                        @click="toggleMangaDexFollow(manga)"
+                      >
+                        <v-icon x-small left>{{ isMangaDexFollowed(manga) ? 'mdi-check' : 'mdi-bookmark-plus-outline' }}</v-icon>
+                        MangaDex
                       </v-btn>
                     </v-card-actions>
                   </v-card>
@@ -879,6 +901,11 @@ export default {
       filterDemographic: [],
       filterAvailableOnly: false,
       filterHideFollowed: false,
+      filterHideMangaDexFollowed: false,
+      mangaDexFollowedUuids: [],
+      mangaDexFollowBusy: {},
+      mangaDexFollowError: {},
+      lastSearchSkippedMangaDexFollow: 0,
       tagOptions: [],
       loadingTags: false,
       savedFiltersHash: '',
@@ -889,13 +916,25 @@ export default {
       searchPageSize: 24,
       searchPage: 1,
       searchTotal: 0,
+      searchPageRawStart: {1: 0},
+      searchKnownPages: 1,
       searchOrder: '',
       searchOrderDir: 'desc',
       followedUuids: [],
       followedUuidsLoadError: '',
       detailsDialog: false,
       detailsManga: null,
+      TARGET_LIBRARY_KEY: 'komga.fork.mangadexsearch.targetlibrary',
     }
+  },
+  watch: {
+    searchLibraryId(val) {
+      if (val) {
+        try {
+          localStorage.setItem(this.TARGET_LIBRARY_KEY, val)
+        } catch (_) { /* ignore */ }
+      }
+    },
   },
   computed: {
     sortOptions() {
@@ -919,6 +958,9 @@ export default {
         d: [...(this.filterDemographic || [])].sort(),
         a: !!this.filterAvailableOnly,
         h: !!this.filterHideFollowed,
+        m: !!this.filterHideMangaDexFollowed,
+        o: this.searchOrder || '',
+        od: this.searchOrderDir || 'desc',
       }
     },
     currentFilterHash() {
@@ -933,10 +975,15 @@ export default {
     lastSearchSkippedNote() {
       const parts = []
       if (this.lastSearchSkippedFollow > 0) parts.push(`${this.lastSearchSkippedFollow} already in follow.txt`)
+      if (this.lastSearchSkippedMangaDexFollow > 0) parts.push(`${this.lastSearchSkippedMangaDexFollow} already on MangaDex follow list`)
       if (this.lastSearchSkippedAvailable > 0) parts.push(`${this.lastSearchSkippedAvailable} without downloadable chapters`)
       return parts.length > 0 ? ` (${parts.join(', ')} hidden)` : ''
     },
+    searchReducesResults() {
+      return this.filterHideFollowed || this.filterHideMangaDexFollowed || this.filterAvailableOnly
+    },
     searchPageCount() {
+      if (this.searchReducesResults) return Math.max(this.searchKnownPages, 1)
       if (!this.searchTotal || this.searchTotal <= this.searchPageSize) return 1
       return Math.min(Math.ceil(this.searchTotal / this.searchPageSize), 417)
     },
@@ -949,6 +996,7 @@ export default {
       if (this.filterDemographic && this.filterDemographic.length > 0) n++
       if (this.filterAvailableOnly) n++
       if (this.filterHideFollowed) n++
+      if (this.filterHideMangaDexFollowed) n++
       return n
     },
     allDownloads() {
@@ -982,6 +1030,7 @@ export default {
     this.loadLibraries()
     this.loadSchedulerSettings()
     this.loadMangaDexPluginStatus()
+    this.loadMangaDexFollowedUuids()
     this.loadFilterDefaults()
     // Eagerly fetch the tag catalog so chips/labels in restored defaults
     // resolve to names instead of bare UUIDs without waiting for focus.
@@ -1009,7 +1058,14 @@ export default {
         this.libraries = response
         if (this.libraries.length > 0) {
           this.selectLibrary(0)
-          if (!this.searchLibraryId) this.searchLibraryId = this.libraries[0].id
+          if (!this.searchLibraryId) {
+            let stored = null
+            try {
+              stored = localStorage.getItem(this.TARGET_LIBRARY_KEY)
+            } catch (_) { /* ignore */ }
+            const match = stored && this.libraries.some(l => l.id === stored)
+            this.searchLibraryId = match ? stored : this.libraries[0].id
+          }
         }
         this.refreshFollowedUuids()
       } catch (error) {
@@ -1047,6 +1103,40 @@ export default {
     },
     isFollowed(manga) {
       return this.followedUuids.indexOf(String(manga.externalId || '').toLowerCase()) >= 0
+    },
+    isMangaDexFollowed(manga) {
+      return this.mangaDexFollowedUuids.indexOf(String(manga.externalId || '').toLowerCase()) >= 0
+    },
+    async loadMangaDexFollowedUuids() {
+      try {
+        const response = await this.$http.get('/api/v1/downloads/mangadex/follows')
+        this.mangaDexFollowedUuids = (response.data && response.data.uuids ? Array.from(response.data.uuids) : []).map(u => String(u).toLowerCase())
+      } catch (_) {
+        this.mangaDexFollowedUuids = []
+      }
+    },
+    async toggleMangaDexFollow(manga) {
+      const id = manga.externalId
+      const uuidLower = String(id || '').toLowerCase()
+      this.$set(this.mangaDexFollowBusy, id, true)
+      this.$set(this.mangaDexFollowError, id, null)
+      try {
+        const wantUnfollow = this.isMangaDexFollowed(manga)
+        if (wantUnfollow) {
+          await this.$http.delete(`/api/v1/downloads/mangadex/follows/${id}`)
+          this.mangaDexFollowedUuids = this.mangaDexFollowedUuids.filter(u => u !== uuidLower)
+          this.showSuccess(`Unfollowed on MangaDex: ${manga.title}`)
+        } else {
+          await this.$http.post(`/api/v1/downloads/mangadex/follows/${id}`)
+          this.mangaDexFollowedUuids = this.mangaDexFollowedUuids.concat([uuidLower])
+          this.showSuccess(`Followed on MangaDex: ${manga.title}`)
+        }
+      } catch (e) {
+        this.$set(this.mangaDexFollowError, id, true)
+        this.showError('MangaDex follow toggle failed: ' + (e?.response?.data?.message || e.message))
+      } finally {
+        this.$set(this.mangaDexFollowBusy, id, false)
+      }
     },
     async toggleFollow(manga) {
       if (!this.searchLibraryId) { this.showError('Select a target library first'); return }
@@ -1128,6 +1218,9 @@ export default {
           this.filterDemographic = Array.isArray(v.d) ? v.d : []
           this.filterAvailableOnly = !!v.a
           this.filterHideFollowed = !!v.h
+          this.filterHideMangaDexFollowed = !!v.m
+          if (typeof v.o === 'string') this.searchOrder = v.o
+          if (v.od === 'asc' || v.od === 'desc') this.searchOrderDir = v.od
         } catch (_) {
           // ignore corrupt value
         }
@@ -1157,6 +1250,7 @@ export default {
       this.filterDemographic = []
       this.filterAvailableOnly = false
       this.filterHideFollowed = false
+      this.filterHideMangaDexFollowed = false
     },
     async fetchPreferredLanguage() {
       // gallery-dl Downloader's default_language is the closest thing to
@@ -1198,7 +1292,11 @@ export default {
     async searchMangaDex(resetPage = true) {
       const q = (this.searchQuery || '').trim()
       if (!q && !this.hasFilters) return
-      if (resetPage) this.searchPage = 1
+      if (resetPage) {
+        this.searchPage = 1
+        this.searchPageRawStart = {1: 0}
+        this.searchKnownPages = 1
+      }
       this.searchLoading = true
       this.searchDone = false
       this.searchResults = []
@@ -1207,48 +1305,86 @@ export default {
       this.searchFollow = {}
       this.lastSearchSkippedAvailable = 0
       this.lastSearchSkippedFollow = 0
+      this.lastSearchSkippedMangaDexFollow = 0
       try {
-        const followedPromise = this.refreshFollowedUuids()
-        const offset = (this.searchPage - 1) * this.searchPageSize
-        const resp = await this.$http.post('/api/v1/plugins/mangadex-metadata/search-advanced', {
-          query: q || null,
-          includedTagIds: this.filterTags,
-          excludedTagIds: this.filterExcludedTags,
-          status: this.filterStatus,
-          contentRating: this.filterRating,
-          publicationDemographic: this.filterDemographic,
-          hasAvailableChapters: this.filterAvailableOnly || null,
-          offset,
-          limit: this.searchPageSize,
-          order: this.searchOrder || null,
-          orderDir: this.searchOrderDir || null,
-        })
-        const page = resp.data || {}
-        let filtered = page.data || []
-        this.searchTotal = page.total || 0
-        await followedPromise
-        if (this.filterHideFollowed && filtered.length > 0) {
-          const before = filtered.length
-          filtered = filtered.filter(r => !this.isFollowed(r))
-          this.lastSearchSkippedFollow = before - filtered.length
+        await this.refreshFollowedUuids()
+        const reduces = this.searchReducesResults
+        const MAX_OFFSET = 10000
+        const MAX_BATCHES = 12
+        let rawCursor = reduces ? (this.searchPageRawStart[this.searchPage] || 0) : (this.searchPage - 1) * this.searchPageSize
+        let nextStart = rawCursor
+        let lang = null
+        let batches = 0
+        let exhausted = false
+        const collected = []
+        while (collected.length < this.searchPageSize && batches < MAX_BATCHES) {
+          if (rawCursor >= MAX_OFFSET) { exhausted = true; break }
+          const limit = Math.min(this.searchPageSize, MAX_OFFSET - rawCursor)
+          const resp = await this.$http.post('/api/v1/plugins/mangadex-metadata/search-advanced', {
+            query: q || null,
+            includedTagIds: this.filterTags,
+            excludedTagIds: this.filterExcludedTags,
+            status: this.filterStatus,
+            contentRating: this.filterRating,
+            publicationDemographic: this.filterDemographic,
+            hasAvailableChapters: this.filterAvailableOnly || null,
+            offset: rawCursor,
+            limit,
+            order: this.searchOrder || null,
+            orderDir: this.searchOrderDir || null,
+          })
+          batches++
+          const page = resp.data || {}
+          const batch = page.data || []
+          this.searchTotal = page.total || 0
+          if (batch.length === 0) { exhausted = true; break }
+
+          let availMap = null
+          if (this.filterAvailableOnly) {
+            let candidates = batch
+            if (this.filterHideFollowed) candidates = candidates.filter(r => !this.isFollowed(r))
+            if (this.filterHideMangaDexFollowed) candidates = candidates.filter(r => !this.isMangaDexFollowed(r))
+            availMap = {}
+            if (candidates.length > 0) {
+              if (lang === null) lang = await this.fetchPreferredLanguage()
+              try {
+                const check = await this.$http.post('/api/v1/plugins/mangadex-metadata/downloadable-check', {
+                  language: lang,
+                  ids: candidates.map(r => r.externalId),
+                })
+                availMap = check.data || {}
+              } catch (e) {
+                this.showError('Downloadable-check failed: ' + (e?.response?.data?.message || e.message))
+              }
+            }
+          }
+
+          let consumed = 0
+          for (let i = 0; i < batch.length; i++) {
+            consumed = i + 1
+            const r = batch[i]
+            if (this.filterHideFollowed && this.isFollowed(r)) { this.lastSearchSkippedFollow++; continue }
+            if (this.filterHideMangaDexFollowed && this.isMangaDexFollowed(r)) { this.lastSearchSkippedMangaDexFollow++; continue }
+            if (this.filterAvailableOnly && availMap && availMap[r.externalId] !== true) { this.lastSearchSkippedAvailable++; continue }
+            collected.push(r)
+            if (collected.length >= this.searchPageSize) break
+          }
+          rawCursor += consumed
+          nextStart = rawCursor
+          if (rawCursor >= this.searchTotal) { exhausted = true; break }
         }
-        if (this.filterAvailableOnly && filtered.length > 0) {
-          const beforeAvail = filtered.length
-          try {
-            const lang = await this.fetchPreferredLanguage()
-            const check = await this.$http.post('/api/v1/plugins/mangadex-metadata/downloadable-check', {
-              language: lang,
-              ids: filtered.map(r => r.externalId),
-            })
-            const map = check.data || {}
-            filtered = filtered.filter(r => map[r.externalId] === true)
-            this.lastSearchSkippedAvailable = beforeAvail - filtered.length
-          } catch (e) {
-            this.showError('Downloadable-check failed: ' + (e?.response?.data?.message || e.message))
+
+        this.searchResults = collected
+        this.searchDone = true
+        if (reduces) {
+          const more = !exhausted && nextStart < Math.min(this.searchTotal || nextStart, MAX_OFFSET)
+          if (more) {
+            this.$set(this.searchPageRawStart, this.searchPage + 1, nextStart)
+            this.searchKnownPages = Math.max(this.searchKnownPages, this.searchPage + 1)
+          } else {
+            this.searchKnownPages = Math.max(this.searchKnownPages, this.searchPage)
           }
         }
-        this.searchResults = filtered
-        this.searchDone = true
       } catch (e) {
         const msg = e?.response?.data?.message || e.message
         this.showError('Search failed: ' + msg + ' (is the MangaDex Metadata plugin enabled?)')

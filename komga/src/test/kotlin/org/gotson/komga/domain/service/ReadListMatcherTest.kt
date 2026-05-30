@@ -52,6 +52,7 @@ class ReadListMatcherTest(
   @BeforeEach
   fun beforeEach() {
     every { mockTaskEmitter.refreshBookMetadata(any<Book>(), any()) } just Runs
+    every { mockTaskEmitter.autoMatchSeriesMetadata(any<String>(), any(), any()) } just Runs
   }
 
   @AfterAll

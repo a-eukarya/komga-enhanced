@@ -252,6 +252,81 @@ Check for new chapters across all followed manga.
 POST /api/v1/downloads/check-new
 ```
 
+### MangaDex Account — Follow List
+
+Read / add / remove a manga on the user's MangaDex account follow list (used by the *Add to MangaDex follow list* button and the *Hide titles already on MangaDex follow list* filter in the advanced MangaDex search). All three require the **MangaDex Subscription** plugin to be enabled and configured; they use that plugin's stored credentials.
+
+```http
+GET /api/v1/downloads/mangadex/follows
+```
+
+Response (lowercase UUIDs, paginated server-side through MangaDex's `/user/follows/manga` and aggregated):
+
+```json
+{
+  "uuids": ["18d92807-8627-4a23-9ef6-12a0a7fbd054", "..."]
+}
+```
+
+```http
+POST   /api/v1/downloads/mangadex/follows/{mangaId}
+DELETE /api/v1/downloads/mangadex/follows/{mangaId}
+```
+
+Response (200 on success, 400 with the same body if the plugin is disabled / unauthenticated):
+
+```json
+{ "success": true, "message": "Followed on MangaDex" }
+```
+
+### MangaDex Subscription — Force Resync
+
+Rewind `last_check_time` and run a feed check immediately. Picks up chapters that were silently dropped earlier (e.g. by a stuck `last_check_time` after a long restart gap, or — before 0.1.4.4 — by the `isUrlAlreadyQueued`/`COMPLETED` guard in `checkFeed`).
+
+```http
+POST /api/v1/downloads/mangadex-subscription/force-resync?lookbackDays=N
+```
+
+`lookbackDays` defaults to `7`. Response shape matches the follow endpoints (`{success, message}`).
+
+## Maintenance API
+
+### List Available Fix Cards
+
+Schema-driven list of one-click maintenance actions that the WebUI renders dynamically on `/settings/fixes`. New fixes are added by registering a `Fix` in `FixRegistry.kt`; no Vue change required. Each entry's `isEnabled` predicate is evaluated server-side so disabled plugins / inactive features simply don't appear in the response.
+
+```http
+GET /api/v1/maintenance/fixes
+```
+
+Response:
+
+```json
+[
+  {
+    "id": "mangadex-force-resync",
+    "title": "MangaDex Subscription — Force Resync",
+    "description": "Rewinds last_check_time and re-runs the followed-manga feed check now...",
+    "icon": "mdi-wrench-outline",
+    "endpoint": "/api/v1/downloads/mangadex-subscription/force-resync",
+    "method": "POST",
+    "params": [
+      {
+        "key": "lookbackDays",
+        "label": "Lookback window (days)",
+        "type": "number",
+        "default": 7,
+        "min": 1,
+        "max": 30,
+        "hint": "How far back to scan the followed-manga feed"
+      }
+    ]
+  }
+]
+```
+
+Param `type` is one of `number`, `string`, `boolean`. The UI sends the collected values as query parameters to the declared `endpoint`/`method`.
+
 ## Oversized Pages API
 
 ### List Oversized Pages

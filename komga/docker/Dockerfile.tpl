@@ -23,7 +23,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN KEPUBIFY_ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "64bit" || echo "$TARGETARCH") && \
     curl -sL --retry 3 \
       "https://github.com/pgaskin/kepubify/releases/latest/download/kepubify-linux-${KEPUBIFY_ARCH}" \
-      -o /usr/bin/kepubify && chmod +x /usr/bin/kepubify
+      -o /usr/bin/kepubify && chmod +x /usr/bin/kepubify && \
+    apt-get purge -y --auto-remove curl python3-pip && \
+    rm -rf /var/lib/apt/lists/*
 ENV LD_LIBRARY_PATH="/usr/lib"
 
 # amd64

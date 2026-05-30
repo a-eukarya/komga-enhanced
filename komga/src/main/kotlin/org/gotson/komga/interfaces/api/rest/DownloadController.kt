@@ -106,6 +106,7 @@ class DownloadController(
     try {
       when (action.action.lowercase()) {
         "cancel" -> downloadExecutor.cancelDownload(id)
+        "pause" -> downloadExecutor.pauseDownload(id)
         "retry" -> downloadExecutor.retryDownload(id)
         "resume" -> downloadExecutor.resumeDownload(id)
         else -> throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Unknown action: ${action.action}")
@@ -415,6 +416,45 @@ class DownloadController(
     return ResponseEntity.ok(
       mapOf("followed" to result.followed, "total" to result.total, "message" to "Synced ${result.followed}/${result.total} manga to MangaDex follows"),
     )
+  }
+
+  @GetMapping("mangadex/follows")
+  @Operation(summary = "Get the set of manga UUIDs followed on the user's MangaDex account", tags = [TagNames.DOWNLOADS])
+  fun getMangaDexFollows(): Map<String, Any> {
+    val ids = mangaDexSubscriptionSyncer.getFollowedMangaIdsFromAccount()
+    return mapOf("uuids" to ids)
+  }
+
+  @PostMapping("mangadex/follows/{mangaId}")
+  @Operation(summary = "Follow a manga on the user's MangaDex account", tags = [TagNames.DOWNLOADS])
+  fun followMangaOnMangaDex(
+    @PathVariable mangaId: String,
+  ): ResponseEntity<Map<String, Any>> {
+    val result = mangaDexSubscriptionSyncer.followMangaOnAccount(mangaId)
+    val status = if (result.success) HttpStatus.OK else HttpStatus.BAD_REQUEST
+    return ResponseEntity.status(status).body(mapOf("success" to result.success, "message" to result.message))
+  }
+
+  @DeleteMapping("mangadex/follows/{mangaId}")
+  @Operation(summary = "Unfollow a manga on the user's MangaDex account", tags = [TagNames.DOWNLOADS])
+  fun unfollowMangaOnMangaDex(
+    @PathVariable mangaId: String,
+  ): ResponseEntity<Map<String, Any>> {
+    val result = mangaDexSubscriptionSyncer.unfollowMangaOnAccount(mangaId)
+    val status = if (result.success) HttpStatus.OK else HttpStatus.BAD_REQUEST
+    return ResponseEntity.status(status).body(mapOf("success" to result.success, "message" to result.message))
+  }
+
+  @PostMapping("mangadex-subscription/force-resync")
+  @Operation(summary = "Rewind MangaDex subscription last_check_time and run a feed check now", tags = [TagNames.DOWNLOADS])
+  fun forceResyncMangaDexSubscription(
+    @RequestParam(defaultValue = "7") lookbackDays: Int,
+  ): ResponseEntity<Map<String, Any>> {
+    val result = mangaDexSubscriptionSyncer.forceResyncFeed(lookbackDays)
+    val status = if (result.success) HttpStatus.OK else HttpStatus.BAD_REQUEST
+    return ResponseEntity
+      .status(status)
+      .body(mapOf("success" to result.success, "message" to result.message))
   }
 
   @GetMapping("scheduler")

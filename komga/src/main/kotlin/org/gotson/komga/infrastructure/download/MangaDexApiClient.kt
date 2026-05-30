@@ -78,36 +78,6 @@ class MangaDexApiClient(
     return info
   }
 
-  fun getMangaDexChapterCount(
-    mangaDexId: String,
-    language: String,
-  ): Int? =
-    try {
-      rateLimiter.waitIfNeeded()
-      val feedUrl =
-        "https://api.mangadex.org/manga/$mangaDexId/feed?" +
-          "translatedLanguage[]=$language&" +
-          "$CONTENT_RATING_PARAMS&" +
-          "limit=0"
-      val request =
-        HttpRequest
-          .newBuilder()
-          .uri(URI.create(feedUrl))
-          .timeout(Duration.ofSeconds(10))
-          .GET()
-          .build()
-      val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-      if (response.statusCode() == 200) {
-        val json = objectMapper.readValue<Map<String, Any?>>(response.body())
-        (json["total"] as? Number)?.toInt()
-      } else {
-        null
-      }
-    } catch (e: Exception) {
-      logger.warn(e) { "Failed to get MangaDex chapter count for $mangaDexId" }
-      null
-    }
-
   fun fetchMangaDexMetadata(mangaId: String): MangaInfo? {
     try {
       val request =
@@ -400,6 +370,7 @@ class MangaDexApiClient(
             val pages = attributes["pages"] as? Int ?: 0
             val publishDate = attributes["publishAt"] as? String
             val chapterLanguage = attributes["translatedLanguage"] as? String
+            val externalUrl = (attributes["externalUrl"] as? String)?.takeIf { it.isNotBlank() }
 
             val relationships = item["relationships"] as? List<*> ?: emptyList<Map<String, Any>>()
             var scanlationGroup: String? = null
@@ -425,6 +396,7 @@ class MangaDexApiClient(
                 publishDate = publishDate,
                 language = chapterLanguage,
                 chapterUrl = "https://mangadex.org/chapter/$id",
+                externalUrl = externalUrl,
               ),
             )
           }

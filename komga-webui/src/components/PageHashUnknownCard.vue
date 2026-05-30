@@ -102,7 +102,7 @@ export default Vue.extend({
           size: this.hash.size,
           action: action,
         })
-        this.$emit('created')
+        this.$emit('created', this.hash)
       } catch (e) {
       }
     },

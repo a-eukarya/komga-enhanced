@@ -4,6 +4,9 @@ module.exports = {
   // with '/' the prod build generates some url(/fonts…) calls in the css chunks, which doesn't work with a servlet context path
   publicPath: process.env.NODE_ENV === 'production' ? './' : '/',
 
+  // Don't ship ~15 MB of .js.map source maps inside the production jar
+  productionSourceMap: false,
+
   pluginOptions: {
     i18n: {
       locale: 'en',

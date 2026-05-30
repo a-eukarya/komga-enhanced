@@ -52,8 +52,8 @@
 
       <v-row>
         <v-slide-x-transition
-          v-for="(element, i) in elements"
-          :key="i"
+          v-for="element in elements"
+          :key="element.hash"
         >
           <page-hash-unknown-card
             class="ma-2"
@@ -170,8 +170,14 @@ export default Vue.extend({
       modalConfirmRemaining: false,
       confirmAction: {} as PageHashAction,
       dialogConfirmI18n: '',
+      prefetchedKey: '',
+      prefetchImages: [] as HTMLImageElement[],
       pageHashUnknownThumbnailUrl,
+      reloadTimer: null as ReturnType<typeof setTimeout> | null,
     }
+  },
+  beforeDestroy() {
+    if (this.reloadTimer) clearTimeout(this.reloadTimer)
   },
   async mounted() {
     await this.loadData(this.page, this.sortActive)
@@ -232,6 +238,31 @@ export default Vue.extend({
       this.totalPages = itemsPage.totalPages
       this.elements = itemsPage.content
       if (this.page > this.totalPages) this.page = this.totalPages
+      this.prefetchNextPage(page, sort)
+    },
+    async prefetchNextPage(page: number, sort: SortActive) {
+      const next = page + 1
+      if (!this.totalPages || next > this.totalPages) return
+      const key = `${next}|${sort.key}|${sort.order}|${this.pageSize}`
+      if (this.prefetchedKey === key) return
+      this.prefetchedKey = key
+      try {
+        const itemsPage = await this.$komgaPageHashes.getUnknownHashes({
+          page: next - 1,
+          size: this.pageSize,
+          sort: [`${sort.key},${sort.order}`],
+        } as PageRequest)
+        // Keep references so the browser doesn't GC-cancel the in-flight loads.
+        this.prefetchImages = Object.freeze(
+          itemsPage.content.map((h: PageHashUnknownDto) => {
+            const img = new Image()
+            img.src = this.pageHashUnknownThumbnailUrl(h, 500)
+            return img
+          }),
+        ) as HTMLImageElement[]
+      } catch (e) {
+        this.prefetchedKey = ''
+      }
     },
     setSort(key: string) {
       if (this.sortActive.key === key) {
@@ -252,8 +283,27 @@ export default Vue.extend({
       this.dialogMatchesPageHash = pageHash
       this.dialogMatches = true
     },
-    pageHashCreated() {
-      this.loadData(this.page, this.sortActive)
+    pageHashCreated(hash: PageHashUnknownDto) {
+      const idx = this.elements.findIndex(e => e.hash === hash.hash && e.size === hash.size)
+      if (idx !== -1) {
+        this.elements.splice(idx, 1)
+        this.totalElements = Math.max(0, this.totalElements - 1)
+      }
+      if (this.elements.length === 0) {
+        if (this.reloadTimer) {
+          clearTimeout(this.reloadTimer)
+          this.reloadTimer = null
+        }
+        this.loadData(this.page, this.sortActive)
+        return
+      }
+      if (this.elements.length < this.pageSize && this.totalElements > this.elements.length) {
+        if (this.reloadTimer) clearTimeout(this.reloadTimer)
+        this.reloadTimer = setTimeout(() => {
+          this.reloadTimer = null
+          this.loadData(this.page, this.sortActive)
+        }, 500)
+      }
     },
     confirmRemaining(action: PageHashAction) {
       this.confirmAction = action

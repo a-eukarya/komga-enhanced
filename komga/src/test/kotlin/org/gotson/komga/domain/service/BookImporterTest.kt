@@ -87,6 +87,7 @@ class BookImporterTest(
   fun initMocks() {
     every { mockTackReceiver.refreshBookMetadata(any<Book>(), any(), any()) } just Runs
     every { mockTackReceiver.refreshBookLocalArtwork(any<Book>(), any()) } just Runs
+    every { mockTackReceiver.autoMatchSeriesMetadata(any<String>(), any(), any()) } just Runs
   }
 
   @AfterEach

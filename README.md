@@ -19,7 +19,7 @@
 - [Key Features](#key-features)
 - [Installation](#installation)
 - [Configuration](#configuration)
-- [API](#api)
+- [API](docs/api-reference.md)
 - [Switching Between Komga Versions](#switching-between-official-komga-and-this-fork)
 - [Comparison](#comparison-with-original-komga)
 - [Documentation](#documentation)
@@ -102,19 +102,23 @@ This fork transforms Komga from a pure media server into a **complete manga mana
 
 ### Download Page
 
-![Download Page](https://github.com/user-attachments/assets/4cf6904a-a182-468c-a1ff-8b4118a378aa)
+![Download Page](https://github.com/user-attachments/assets/80ed9a1f-f82c-4a5b-8b22-57b61740d765)
+
+### Integrated Mangadex Search
+
+![Integrated Mangadex Search](https://github.com/user-attachments/assets/e2355a2f-a3f0-4b11-970b-96601ec2b52d)
 
 > **New Download** triggers a one-time download only — it does not add the URL to your follow list.
 
-### Plugin Configuration
+### Follow List Configuration
 
-![Plugin Configuration](https://github.com/user-attachments/assets/43463b26-c436-4dc2-8619-351c37e43843)
-![Plugin Configuration 2](https://github.com/user-attachments/assets/16de37ef-e2e9-465a-9298-c695ad58243b)
+![Follow List Configuration](https://github.com/user-attachments/assets/43463b26-c436-4dc2-8619-351c37e43843)
+![Follow List Configuration 2](https://github.com/user-attachments/assets/16de37ef-e2e9-465a-9298-c695ad58243b)
 ![Save after edit](https://github.com/user-attachments/assets/57cb7b83-9aa2-4469-a720-bcc5eba92ab2)
 
 ### Plugin Manager
 
-![Plugins](https://github.com/user-attachments/assets/b1a40557-dfc4-4e6e-88e3-d587fc7dafbe)
+![Plugins](https://github.com/user-attachments/assets/baebe276-5a05-4726-8cbe-7d7399e68fb4)
 
 ### Manual Backups
 
@@ -127,6 +131,10 @@ This fork transforms Komga from a pure media server into a **complete manga mana
 ### Color Themes
 
 ![Color Themes](https://github.com/user-attachments/assets/f7e79d95-e66a-4a3c-98b7-0fff97a526c0)
+
+### Fixes Page
+
+![Fixes Page](https://github.com/user-attachments/assets/10f81194-57bd-42c1-a900-825ee988b1d9)
 
 ---
 
@@ -258,11 +266,11 @@ Beyond the built-in plugins, the fork can **load external plugin JARs at runtime
 > **Docker:** the plugins folder lives at `/config/plugins`, which is **already inside the mounted `/config` volume** — no extra volume mount is needed. Drop JARs there (or upload via the UI) and they persist across container restarts. The bundled default plugins (e.g. Kitsu) are auto-installed there on first start.
 
 - **Two plugin types today:** `MetadataProviderPlugin` (search + metadata, shows up in *Search Online Databases* and Auto Metadata Match) and `NotifierPlugin` (receives `DOWNLOAD_COMPLETED` / `DOWNLOAD_FAILED` events — webhook, Discord, …)
-- **Isolated class loading** — each JAR runs in its own class loader; load failures never crash the server
+- **Class-loader isolation (SPI-only)** — each JAR runs under a `SpiOnlyClassLoader` whose parent whitelists only the SPI (`org.gotson.komga.infrastructure.plugin.api.*`), JDK (`java.*`/`javax.*`), Kotlin runtime (`kotlin.*`/`kotlinx.*`) and Jackson (`com.fasterxml.jackson.*`). A plugin attempting `import org.gotson.komga.domain.…` or Spring gets `ClassNotFoundException("Plugin denied access to '…' — class-loader isolation. …")`. Bundle anything else you need (OkHttp, JDBC driver, …) into your plugin JAR. Load failures never crash the server.
 - **Default external plugin:** the **Kitsu** provider is shipped this way (bundled in the app, auto-installed on first start) as the reference implementation
 - **Write your own:** copy [`plugins/plugin-template`](plugins/plugin-template), edit one Kotlin file, run `./gradlew build`, install the JAR. Full guide: **[PLUGINS.md](PLUGINS.md)**
 
-> **Security:** installing a plugin runs arbitrary code inside the Komga JVM (no sandbox). The install endpoint is admin-only — only install plugins you trust.
+> **Security model — class-loader isolation, NOT a sandbox.** The whitelist above blocks compile-time/runtime imports of Komga internals so a plugin can't reach into the host through the SPI's back door. It does **not** restrict filesystem (`java.io.File`), network (`java.net.http`) or reflection (`java.lang.reflect`) — those are intentionally allowed because plugins call external APIs. An installed external JAR runs arbitrary code with the same OS rights as the Komga process. The install endpoint is admin-only — only install plugins you trust. See [PLUGINS.md → Security model](PLUGINS.md#security-model) for the full statement of limits.
 
 ### MangaDex Search on Downloads Page
 
@@ -393,7 +401,7 @@ GUI-triggered one-time maintenance actions under **Settings → Fixes**. Cards a
 
 Two scheduled jobs run daily and prune log/event tables to keep the SQLite file lean:
 
-- `PLUGIN_LOG` — entries older than 30 days are deleted (was unbounded; observed 119k+ rows on installs without retention)
+- `PLUGIN_LOG` — entries older than 7 days are deleted (was unbounded; observed 119k+ rows on installs without retention)
 - `HISTORICAL_EVENT` + `HISTORICAL_EVENT_PROPERTIES` — pruned together (the schema has no `ON DELETE CASCADE`, so the DAO deletes properties first then events)
 
 > **Note on file size:** SQLite does **not** shrink `database.sqlite` when rows are deleted — freed pages are reused for future writes but the file stays the same size on disk (it just stops growing). To actually reclaim space, run `VACUUM;` once against the database while Komga is stopped (e.g. `sqlite3 database.sqlite "VACUUM;"`). Retention prevents unbounded growth; VACUUM is the one-time reclaim.
@@ -405,12 +413,6 @@ New chapters are automatically scanned after download completes:
 - Uses targeted `scanSeriesFolder()` — only processes the affected series folder
 - New books are added, analyzed, and chapter URLs imported automatically
 - No full library scan needed
-
----
-
-## API
-
-Full API documentation with request/response examples: **[API Reference](docs/api-reference.md)**
 
 ---
 
@@ -436,11 +438,21 @@ See [Quick Start](#quick-start) for Docker and Docker Compose commands.
 
 ### Updating gallery-dl-komga in Docker
 
-gallery-dl-komga is installed via pip inside the Docker image. To update:
+gallery-dl-komga is installed via pip inside the Docker image. The fork keeps the upstream version string (`1.32.1`), so a plain `-U` will **not** pull in new commits — pip sees an unchanged version and reuses its cached wheel, and GitHub caches the branch tarball for a few minutes. Force a clean reinstall:
 
 ```bash
-docker exec -u 0 komga pip3 install --break-system-packages -U https://github.com/08shiro80/gallery-dl-komga/archive/refs/heads/master.tar.gz
+docker exec -u 0 komga pip3 install --break-system-packages --no-cache-dir --force-reinstall \
+  https://github.com/08shiro80/gallery-dl-komga/archive/refs/heads/master.tar.gz
 ```
+
+To pin an exact commit — immutable, and it bypasses the branch-tarball cache entirely — use its SHA instead of `refs/heads/master`:
+
+```bash
+docker exec -u 0 komga pip3 install --break-system-packages --no-cache-dir --force-reinstall \
+  https://github.com/08shiro80/gallery-dl-komga/archive/<commit-sha>.tar.gz
+```
+
+gallery-dl runs as a subprocess per download, so no Komga restart is needed — the next download uses the updated version.
 
 ### JAR
 
