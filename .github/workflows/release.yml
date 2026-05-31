@@ -163,13 +163,6 @@ jobs:
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
-      - name: Resolve gallery-dl-komga master SHA
-        id: gallery_rev
-        run: |
-          SHA=$(curl -fsSL "https://api.github.com/repos/08shiro80/gallery-dl-komga/commits/master" | jq -r .sha)
-          echo "sha=${SHA}" >> $GITHUB_OUTPUT
-          echo "gallery-dl-komga master @ ${SHA}"
-
       - name: Build and push Docker images
         uses: docker/build-push-action@v7
         with:
@@ -177,7 +170,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            GALLERY_DL_REV=${{ steps.gallery_rev.outputs.sha }}
+            GALLERY_DL_REV=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=komga-docker
           cache-to: type=gha,scope=komga-docker,mode=max
           tags: ${{ steps.docker_tags.outputs.tags }}

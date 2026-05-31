@@ -6,6 +6,33 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## [0.1.4.5] - 2026-05-31 Hotfix
+
+### Fix: gallery-dl resume cleanup recursively deleted entire series folders (data loss)
+
+`GalleryDlWrapper` ran two destructive cleanup blocks during the non-MangaDex resume path that, under real-world layouts, wiped entire libraries:
+
+- **Lines 530-538 (resume entry):** `destDir.walkTopDown().filter { dir contains image files }.forEach { it.deleteRecursively() }`. `walkTopDown()` includes `destDir` itself, so any series root containing a `cover.jpg` matched the filter and was recursively deleted along with every CBZ, `series.json` and `.gallery-dl-archive.txt` it held.
+- **Lines 925-936 (post-download):** `destDir.listFiles().filter { isDirectory }.forEach { it.deleteRecursively() }`. With extractors that nest into `{category}/{manga}/` (e.g. `manhuaplus` via the Madara base), this wiped the entire subtree of finished chapters in one shot.
+
+Concrete incident (2026-05-31, manhuaplus *Magic Emperor*): 864 finished chapters plus `cover.jpg` and `series.json` were destroyed in a single resume run. Komga's DB still held the book records, so subsequent metadata refreshes produced a flood of `NoSuchFileException` against every CBZ path.
+
+The cleanup code was also pointless: gallery-dl's own downloader treats `.part` files as byte-range resume markers (`downloader/http.py:159` — `Range: bytes=<size>-`), so removing them only forces a from-scratch redownload. The `zip` postprocessor with `keep-files: false` already prunes packed page files after each successful chapter. Both delete blocks are removed entirely; nothing replaces them.
+
+### Fix: gallery-dl extractors without an explicit `directory` override nested CBZs under `{category}/{manga}/`
+
+`GalleryDlProcess.createTempConfigFile` only overrode `extractor.<site>.directory` for sites declared in `getDefaultWebsiteConfigs` (mangadex, mangahere, comick, ...). Any extractor not in that map fell through to its own default `directory_fmt` — for everything Madara-based (`manhuaplus`, `asurascans` mirrors, etc.) that is `("{category}", "{manga}", "c{chapter}…")`, which writes finished CBZs three levels deep under the series root. The wrapper then relied on the post-run move-to-root step (`GalleryDlWrapper.kt:655-667`) to flatten them, but that hand-off depended on `.gallery-dl-archive.txt` and the leftover subdirs surviving cleanup — which they didn't (see above).
+
+An extractor-global `directory: ["c{chapter:>03}"]` fallback is now set on `extractor` itself. Site-specific overrides keep their existing templates (gallery-dl resolves per-extractor config before the global fallback); unconfigured extractors now write directly into the series root, so the move step usually has nothing to do and `.gallery-dl-archive.txt` stays at a stable path.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` | Both destructive cleanup blocks removed (530-538 and 925-936). |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlProcess.kt` | Added `extractor.directory` global fallback in `createTempConfigFile`. |
+
+---
+
 ## [0.1.4.4] - 2026-05-30
 
 ### Fix: MangaDex Subscription feed — new chapters silently skipped for any manga that was ever queued

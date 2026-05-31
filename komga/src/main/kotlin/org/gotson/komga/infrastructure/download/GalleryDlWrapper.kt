@@ -527,15 +527,6 @@ class GalleryDlWrapper(
           .filter { numberByCbz[it] == null || numberByCbz[it] == maxComplete }
           .forEach { deleteQuietly(it) }
 
-        // Remove leftover chapter image folders from interrupted runs (page images and/or a
-        // half-downloaded ".part" file). Complete chapters have none (keep-files:false), so
-        // any such folder is stale; deleting it forces a clean, full re-download.
-        val leftoverExtensions = setOf("jpg", "jpeg", "png", "webp", "gif", "avif", "bmp", "part")
-        destDir
-          .walkTopDown()
-          .filter { dir -> dir.isDirectory && dir.listFiles()?.any { it.isFile && it.extension.lowercase() in leftoverExtensions } == true }
-          .toList()
-          .forEach { it.deleteRecursively() }
         if (keptComplete.isNotEmpty()) filesDownloaded.set(keptComplete.size)
 
         var resumeInputFile: File? = null
@@ -921,26 +912,6 @@ class GalleryDlWrapper(
           ?: emptyList()
 
       logger.debug { "Found ${downloadedFiles.size} CBZ files in ${destDir.absolutePath}" }
-
-      try {
-        destDir
-          .listFiles()
-          ?.filter { it.isDirectory }
-          ?.forEach { folder ->
-            val deleted = folder.deleteRecursively()
-            if (deleted) {
-              logger.debug { "Deleted subdirectory: ${folder.name}" }
-            } else {
-              logger.warn { "Failed to delete subdirectory: ${folder.name}" }
-            }
-          }
-      } catch (e: Exception) {
-        logger.warn(e) { "Failed to clean up chapter folders" }
-        logToDatabase(
-          org.gotson.komga.domain.model.LogLevel.WARN,
-          "Failed to clean up chapter folders: ${e.message}",
-        )
-      }
 
       logger.debug { "Download completed: ${downloadedFiles.size} files (manga: ${mangaInfo.title})" }
       logToDatabase(org.gotson.komga.domain.model.LogLevel.INFO, "Download completed successfully: ${downloadedFiles.size} files downloaded from $url")

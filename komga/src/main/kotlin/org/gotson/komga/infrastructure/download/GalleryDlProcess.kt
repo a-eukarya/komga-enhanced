@@ -101,11 +101,13 @@ class GalleryDlProcess {
       }
     }
 
+    val globalDirectory = chapterNaming?.let { listOf(it) } ?: listOf("c{chapter:>03}{chapter_minor}")
     val config =
       mutableMapOf<String, Any>(
         "extractor" to
           mutableMapOf<String, Any>(
             "base-directory" to "",
+            "directory" to globalDirectory,
           ).apply { putAll(websiteConfigs) },
         "postprocessors" to
           listOf(
