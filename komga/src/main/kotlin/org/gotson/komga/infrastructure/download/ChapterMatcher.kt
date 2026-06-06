@@ -13,13 +13,15 @@ private val logger = KotlinLogging.logger {}
 class ChapterMatcher {
   companion object {
     val cbzUuidRegex = """[\[\(]([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})[\]\)]""".toRegex()
-    private val chapterNumCRegex = Regex("""^c(\d+(?:\.\d+)?)""")
-    private val chapterNumChRegex = Regex("""^ch\.?\s*(\d+(?:\.\d+)?)""")
+    private val chapterNumCRegex = Regex("""^c(\d+(?:\.\d+)?[a-z]?)""")
+    private val chapterNumChRegex = Regex("""^ch\.?\s*(\d+(?:\.\d+)?[a-z]?)""")
+    private val chapterNumChapterRegex = Regex("""^chapter[\s_]+(\d+(?:\.\d+)?[a-z]?)""")
     private val zipCommentUuidRegex = Regex("Chapter UUID:\\s*([0-9a-f-]+)")
     private val comicInfoWebRegex = Regex("<Web>(.+?)</Web>")
     private val volumePrefixRegex = Regex("^v\\d+ .+")
     private val bracketGroupRegex = Regex("\\[(.+?)]$")
     private val scanlationGroupRegex = """\[([^\]]+)\]\s*$""".toRegex()
+    private val chapterNumericSplitRegex = Regex("""^(\d+(?:\.\d+)?)([^\d.].*)?$""")
   }
 
   fun extractChapterId(cbzPath: Path): String? {
@@ -54,6 +56,7 @@ class ChapterMatcher {
     if (volumePrefixRegex.matches(name)) name = name.substringAfter(" ")
     val match =
       chapterNumCRegex.find(name)
+        ?: chapterNumChapterRegex.find(name)
         ?: chapterNumChRegex.find(name)
     val raw = match?.groupValues?.get(1) ?: return null
     return try {
@@ -69,25 +72,33 @@ class ChapterMatcher {
     val name = if (volumePrefixRegex.matches(nameLower)) nameLower.substringAfter(" ") else nameLower
     val cMatch = chapterNumCRegex.find(name)
     if (cMatch != null) return cMatch.groupValues[1]
+    val chapterMatch = chapterNumChapterRegex.find(name)
+    if (chapterMatch != null) return chapterMatch.groupValues[1]
     val chMatch = chapterNumChRegex.find(name)
     if (chMatch != null) return chMatch.groupValues[1]
     return null
   }
 
-  fun padChapterNumber(chapterNumStr: String): String =
-    try {
-      val num = chapterNumStr.toDouble()
-      if (num == num.toLong().toDouble()) {
-        String.format("%03d", num.toLong())
-      } else {
-        val intPart = num.toLong()
-        val decimalPart = chapterNumStr.substringAfter(".", "")
-        String.format("%03d.%s", intPart, decimalPart)
-      }
+  fun padChapterNumber(chapterNumStr: String): String {
+    val match = chapterNumericSplitRegex.matchEntire(chapterNumStr) ?: return chapterNumStr
+    val numericPart = match.groupValues[1]
+    val suffix = match.groupValues[2]
+    return try {
+      val num = numericPart.toDouble()
+      val paddedNumeric =
+        if (num == num.toLong().toDouble()) {
+          String.format("%03d", num.toLong())
+        } else {
+          val intPart = num.toLong()
+          val decimalPart = numericPart.substringAfter(".", "")
+          String.format("%03d.%s", intPart, decimalPart)
+        }
+      paddedNumeric + suffix
     } catch (e: NumberFormatException) {
       logger.debug(e) { "Could not pad chapter number: $chapterNumStr" }
       chapterNumStr
     }
+  }
 
   fun normalizeDoubleBracketFilenames(dir: File) {
     val cbzFiles =
@@ -197,7 +208,10 @@ class ChapterMatcher {
       if (volumePrefixRegex.matches(name)) name.substringAfter(" ") else name
     return chapterPart.startsWith("c$paddedChapter ") || chapterPart == "c$paddedChapter" ||
       chapterPart.startsWith("c$chapterStr ") || chapterPart == "c$chapterStr" ||
-      chapterPart.startsWith("ch. $paddedChapter ") || chapterPart.startsWith("ch. $paddedChapter-") || chapterPart == "ch. $paddedChapter"
+      chapterPart.startsWith("ch. $paddedChapter ") || chapterPart.startsWith("ch. $paddedChapter-") || chapterPart == "ch. $paddedChapter" ||
+      chapterPart.startsWith("chapter $paddedChapter ") || chapterPart == "chapter $paddedChapter" ||
+      chapterPart.startsWith("chapter $chapterStr ") || chapterPart == "chapter $chapterStr" ||
+      chapterPart.startsWith("chapter_$paddedChapter") || chapterPart.startsWith("chapter_$chapterStr")
   }
 
   fun matchesChapterAndGroup(

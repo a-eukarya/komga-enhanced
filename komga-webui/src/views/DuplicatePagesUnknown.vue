@@ -174,6 +174,7 @@ export default Vue.extend({
       prefetchImages: [] as HTMLImageElement[],
       pageHashUnknownThumbnailUrl,
       reloadTimer: null as ReturnType<typeof setTimeout> | null,
+      recentlyActioned: new Set<string>(),
     }
   },
   beforeDestroy() {
@@ -236,7 +237,7 @@ export default Vue.extend({
       const itemsPage = await this.$komgaPageHashes.getUnknownHashes(pageRequest)
       this.totalElements = itemsPage.totalElements
       this.totalPages = itemsPage.totalPages
-      this.elements = itemsPage.content
+      this.elements = itemsPage.content.filter(e => !this.recentlyActioned.has(`${e.hash}_${e.size}`))
       if (this.page > this.totalPages) this.page = this.totalPages
       this.prefetchNextPage(page, sort)
     },
@@ -284,6 +285,9 @@ export default Vue.extend({
       this.dialogMatches = true
     },
     pageHashCreated(hash: PageHashUnknownDto) {
+      const key = `${hash.hash}_${hash.size}`
+      this.recentlyActioned.add(key)
+      setTimeout(() => this.recentlyActioned.delete(key), 10000)
       const idx = this.elements.findIndex(e => e.hash === hash.hash && e.size === hash.size)
       if (idx !== -1) {
         this.elements.splice(idx, 1)

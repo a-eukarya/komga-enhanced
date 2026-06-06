@@ -179,15 +179,17 @@ tasks {
   register<Exec>("npmInstall") {
     group = "web"
     workingDir(webui)
-    inputs.file("$webui/package.json")
-    outputs.dir("$webui/node_modules")
+    inputs.file("$webui/package.json").withPropertyName("packageJson").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("$webui/package-lock.json").withPropertyName("packageLock").withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.dir("$webui/node_modules").withPropertyName("nodeModules")
+    outputs.cacheIf { true }
     commandLine(
       if (Os.isFamily(Os.FAMILY_WINDOWS)) {
         "npm.cmd"
       } else {
         "npm"
       },
-      "install",
+      "ci",
     )
   }
 
@@ -195,8 +197,15 @@ tasks {
     group = "web"
     dependsOn("npmInstall")
     workingDir(webui)
-    inputs.dir(webui)
-    outputs.dir("$webui/dist")
+    inputs.dir("$webui/src").withPropertyName("webuiSrc").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.dir("$webui/public").withPropertyName("webuiPublic").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("$webui/package.json").withPropertyName("packageJson").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("$webui/package-lock.json").withPropertyName("packageLock").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("$webui/vue.config.js").withPropertyName("vueConfig").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("$webui/tsconfig.json").withPropertyName("tsConfig").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("$webui/babel.config.js").withPropertyName("babelConfig").withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.dir("$webui/dist").withPropertyName("webuiDist")
+    outputs.cacheIf { true }
     commandLine(
       if (Os.isFamily(Os.FAMILY_WINDOWS)) {
         "npm.cmd"
@@ -208,20 +217,18 @@ tasks {
     )
   }
 
-  // copy the webui build into public
   register<Sync>("copyWebDist") {
     group = "web"
     dependsOn("npmBuild")
     from("$webui/dist/")
-    into("$projectDir/src/main/resources/public/")
+    into(layout.buildDirectory.dir("processedResources/public"))
   }
 
-  // modifies index.html to inject ThymeLeaf th: tags
   register<Copy>("prepareThymeLeaf") {
     group = "web"
     dependsOn("copyWebDist")
     from("$webui/dist/index.html")
-    into("$projectDir/src/main/resources/public/")
+    into(layout.buildDirectory.dir("processedResources/public"))
     filter { line ->
       line.replace("((?:src|content|href)=\")([\\w]*/.*?)(\")".toRegex()) {
         it.groups[0]?.value + " th:" + it.groups[1]?.value + "@{" + it.groups[2]?.value?.prefixIfNot("/") + "}" + it.groups[3]?.value
@@ -229,20 +236,22 @@ tasks {
     }
   }
 
-  // bundle dynamically-loaded default plugins (built as separate Gradle modules)
-  // into the app resources; PluginRegistry installs them into the config dir on startup
   register<Copy>("copyDefaultPlugins") {
     group = "build"
     defaultPluginProjects.forEach { from(it.tasks.named("jar")) }
-    into("$projectDir/src/main/resources/default-plugins/")
+    into(layout.buildDirectory.dir("processedResources/default-plugins"))
   }
 
   withType<ProcessResources> {
-    dependsOn("copyDefaultPlugins")
+    dependsOn("copyDefaultPlugins", "prepareThymeLeaf")
     filesMatching("application*.yml") {
-      expand(project.properties)
+      expand(
+        mapOf(
+          "version" to project.version,
+          "rootDir" to rootDir,
+        ),
+      )
     }
-    mustRunAfter(getByName("prepareThymeLeaf"))
   }
 
   register<Test>("benchmark") {
@@ -379,23 +388,22 @@ tasks.named<JooqGenerate>("generateTasksJooq") {
   dependsOn("flywayMigrateTasks")
 }
 
-tasks.whenTaskAdded {
-  if (name == "kaptGenerateStubsKotlin") {
-    dependsOn("generateTasksJooq")
-  }
+tasks.matching { it.name == "kaptGenerateStubsKotlin" }.configureEach {
+  dependsOn("generateTasksJooq")
 }
 
 sourceSets {
-  // add a flyway sourceSet
   val flyway by creating {
     compileClasspath += sourceSets.main.get().compileClasspath
     runtimeClasspath += sourceSets.main.get().runtimeClasspath
   }
-  // main sourceSet depends on the output of flyway sourceSet, and generated jooq classes
   main {
     java {
       output.dir(flyway.output)
       srcDir("build/generated-src/jooq/tasks")
+    }
+    resources {
+      srcDir("build/processedResources")
     }
   }
 }
@@ -424,6 +432,8 @@ tasks.jacocoTestReport {
 configure<org.jlleitschuh.gradle.ktlint.KtlintExtension> {
   filter {
     exclude("**/db/migration/**")
+    exclude { it.file.path.contains("${layout.buildDirectory.get().asFile}${File.separator}generated") }
+    exclude { it.file.path.contains("${layout.buildDirectory.get().asFile}${File.separator}generated-src") }
   }
 }
 

@@ -6,12 +6,11 @@ import org.gotson.komga.domain.model.IgnoredOversizedPage
 import org.gotson.komga.domain.persistence.BookRepository
 import org.gotson.komga.domain.persistence.IgnoredOversizedPageRepository
 import org.gotson.komga.domain.persistence.MediaRepository
-import org.gotson.komga.domain.persistence.SeriesMetadataRepository
-import org.gotson.komga.domain.persistence.SeriesRepository
 import org.gotson.komga.domain.service.BookPageEditor
 import org.gotson.komga.domain.service.PageSplitter
 import org.gotson.komga.domain.service.SplitMode
 import org.gotson.komga.domain.service.SplitResult
+import org.gotson.komga.infrastructure.background.BackgroundJobTracker
 import org.gotson.komga.infrastructure.openapi.OpenApiConfiguration
 import org.gotson.komga.infrastructure.openapi.PageableAsQueryParam
 import org.gotson.komga.interfaces.api.rest.dto.DeleteOversizedPageRequestDto
@@ -38,6 +37,7 @@ import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
 import org.springframework.web.server.ResponseStatusException
+import java.util.concurrent.atomic.AtomicBoolean
 
 @RestController
 @RequestMapping("api/v1/media-management/oversized-pages", produces = [MediaType.APPLICATION_JSON_VALUE])
@@ -45,12 +45,16 @@ import org.springframework.web.server.ResponseStatusException
 class OversizedPagesController(
   private val mediaRepository: MediaRepository,
   private val bookRepository: BookRepository,
-  private val seriesRepository: SeriesRepository,
-  private val seriesMetadataRepository: SeriesMetadataRepository,
   private val pageSplitter: PageSplitter,
   private val ignoredOversizedPageRepository: IgnoredOversizedPageRepository,
   private val bookPageEditor: BookPageEditor,
+  private val backgroundJobTracker: BackgroundJobTracker,
 ) {
+  private val splitAllInProgress = AtomicBoolean(false)
+
+  @GetMapping("split-all/status")
+  fun splitAllStatus(): Map<String, Boolean> = mapOf("inProgress" to splitAllInProgress.get())
+
   @Operation(
     summary = "List oversized pages",
     tags = [OpenApiConfiguration.TagNames.DUPLICATE_PAGES],
@@ -80,65 +84,54 @@ class OversizedPagesController(
         ignoredOversizedPageRepository.findKeysByMode(normalizedMode)
       }
 
-    val allBooks = bookRepository.findAll()
+    val candidates = mediaRepository.findAllOversizedPageCandidates(PageSplitter.MIN_VALID_DIMENSION)
     val oversizedPages = mutableListOf<OversizedPageDto>()
 
-    for (book in allBooks) {
-      val media = mediaRepository.findByIdOrNull(book.id) ?: continue
-      val series = seriesRepository.findByIdOrNull(book.seriesId)
-      val seriesMetadata = seriesMetadataRepository.findByIdOrNull(book.seriesId)
-      val displaySeriesTitle = seriesMetadata?.title?.takeIf { it.isNotBlank() } ?: series?.name.orEmpty()
+    for (candidate in candidates) {
+      val displaySeriesTitle = candidate.seriesTitle?.takeIf { it.isNotBlank() } ?: candidate.seriesName
 
       if (searchTerm != null) {
-        val bookMatch = book.name.lowercase().contains(searchTerm)
-        val seriesMatch = displaySeriesTitle.lowercase().contains(searchTerm) || series?.name?.lowercase()?.contains(searchTerm) == true
+        val bookMatch = candidate.bookName.lowercase().contains(searchTerm)
+        val seriesMatch = displaySeriesTitle.lowercase().contains(searchTerm) || candidate.seriesName.lowercase().contains(searchTerm)
         if (!bookMatch && !seriesMatch) continue
       }
 
-      media.pages.forEachIndexed { index, bookPage ->
-        val dimension = bookPage.dimension
-        if (dimension != null && dimension.width > 0 && dimension.height > 0) {
-          // Reject pathological strip images (webtoon dividers like 720x1, 1200x15, 1200x25)
-          if (dimension.width < PageSplitter.MIN_VALID_DIMENSION || dimension.height < PageSplitter.MIN_VALID_DIMENSION) return@forEachIndexed
-          val ratio =
-            if (wideMode) {
-              dimension.width.toDouble() / dimension.height.toDouble()
-            } else {
-              dimension.height.toDouble() / dimension.width.toDouble()
-            }
-          // In WIDE mode, anything beyond MAX_WIDE_RATIO is a divider/banner strip, not a double page
-          if (wideMode && ratio > PageSplitter.MAX_WIDE_RATIO) return@forEachIndexed
-          val matches =
-            if (useRatio) {
-              ratio >= minRatio!!
-            } else if (wideMode) {
-              dimension.width >= effectiveMinWidth && dimension.width > dimension.height
-            } else {
-              dimension.width >= effectiveMinWidth || dimension.height >= effectiveMinHeight
-            }
-
-          if (matches) {
-            val pageNumber = index + 1
-            if (!includeIgnored && Pair(book.id, pageNumber) in ignoredKeys) {
-              return@forEachIndexed
-            }
-            oversizedPages.add(
-              OversizedPageDto(
-                bookId = book.id,
-                bookName = book.name,
-                seriesId = book.seriesId,
-                seriesTitle = displaySeriesTitle,
-                pageNumber = pageNumber,
-                width = dimension.width,
-                height = dimension.height,
-                ratio = Math.round(ratio * 100.0) / 100.0,
-                fileSize = bookPage.fileSize ?: 0L,
-                mediaType = bookPage.mediaType,
-              ),
-            )
-          }
+      val width = candidate.width
+      val height = candidate.height
+      if (width <= 0 || height <= 0) continue
+      val ratio =
+        if (wideMode) {
+          width.toDouble() / height.toDouble()
+        } else {
+          height.toDouble() / width.toDouble()
         }
-      }
+      if (wideMode && ratio > PageSplitter.MAX_WIDE_RATIO) continue
+      val matches =
+        if (useRatio) {
+          ratio >= minRatio!!
+        } else if (wideMode) {
+          width >= effectiveMinWidth && width > height
+        } else {
+          width >= effectiveMinWidth || height >= effectiveMinHeight
+        }
+      if (!matches) continue
+
+      if (!includeIgnored && Pair(candidate.bookId, candidate.pageNumber) in ignoredKeys) continue
+
+      oversizedPages.add(
+        OversizedPageDto(
+          bookId = candidate.bookId,
+          bookName = candidate.bookName,
+          seriesId = candidate.seriesId,
+          seriesTitle = displaySeriesTitle,
+          pageNumber = candidate.pageNumber,
+          width = width,
+          height = height,
+          ratio = Math.round(ratio * 100.0) / 100.0,
+          fileSize = candidate.fileSize,
+          mediaType = candidate.mediaType,
+        ),
+      )
     }
 
     val order = page.sort.firstOrNull()
@@ -220,10 +213,19 @@ class OversizedPagesController(
   fun splitAllTallPages(
     @RequestBody request: SplitRequestDto,
   ): List<SplitResultDto> {
-    val results = mutableListOf<SplitResultDto>()
+    if (!splitAllInProgress.compareAndSet(false, true)) {
+      throw ResponseStatusException(HttpStatus.CONFLICT, "Split-All operation already in progress")
+    }
+    backgroundJobTracker.start("Split All")
+    return try {
+      runSplitAll(request)
+    } finally {
+      splitAllInProgress.set(false)
+      backgroundJobTracker.stop("Split All")
+    }
+  }
 
-    val allBooks = bookRepository.findAll()
-
+  private fun runSplitAll(request: SplitRequestDto): List<SplitResultDto> {
     val splitMode = if (request.mode?.equals("wide", ignoreCase = true) == true) SplitMode.WIDE else SplitMode.TALL
     val normalizedMode = if (splitMode == SplitMode.WIDE) "wide" else "tall"
     val effectiveMaxHeight = request.maxHeight
@@ -235,52 +237,88 @@ class OversizedPagesController(
         else -> null
       }
 
-    for (book in allBooks) {
-      val media = mediaRepository.findByIdOrNull(book.id) ?: continue
+    val wideMode = splitMode == SplitMode.WIDE
+    val useRatio = request.minRatio != null
+    val effectiveMinWidth = request.minWidth ?: 4000
+    val effectiveMinHeight = request.minHeight ?: 4000
+    val searchTerm =
+      request.search
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.lowercase()
+    val includeIgnored = request.includeIgnored == true
 
-      val hasOversizedPages =
-        media.pages.any { page ->
-          val dimension = page.dimension
-          if (dimension == null || dimension.width == 0 || dimension.height == 0) return@any false
-          if (dimension.width < PageSplitter.MIN_VALID_DIMENSION || dimension.height < PageSplitter.MIN_VALID_DIMENSION) return@any false
-          when {
-            splitMode == SplitMode.WIDE -> {
-              val aspectRatio = dimension.width.toDouble() / dimension.height.toDouble()
-              aspectRatio <= PageSplitter.MAX_WIDE_RATIO && aspectRatio > (effectiveMaxRatio ?: 1.0)
-            }
-            effectiveMaxRatio != null ->
-              dimension.height.toDouble() / dimension.width.toDouble() > effectiveMaxRatio
-            else ->
-              dimension.height > (effectiveMaxHeight ?: 2000)
-          }
+    val ignoredKeys =
+      if (includeIgnored) {
+        emptySet()
+      } else {
+        ignoredOversizedPageRepository.findKeysByMode(normalizedMode)
+      }
+
+    val candidates = mediaRepository.findAllOversizedPageCandidates(PageSplitter.MIN_VALID_DIMENSION)
+    val pagesByBook = mutableMapOf<String, MutableSet<Int>>()
+
+    for (candidate in candidates) {
+      val displaySeriesTitle = candidate.seriesTitle?.takeIf { it.isNotBlank() } ?: candidate.seriesName
+
+      if (searchTerm != null) {
+        val bookMatch = candidate.bookName.lowercase().contains(searchTerm)
+        val seriesMatch = displaySeriesTitle.lowercase().contains(searchTerm) || candidate.seriesName.lowercase().contains(searchTerm)
+        if (!bookMatch && !seriesMatch) continue
+      }
+
+      val width = candidate.width
+      val height = candidate.height
+      if (width <= 0 || height <= 0) continue
+      val ratio =
+        if (wideMode) {
+          width.toDouble() / height.toDouble()
+        } else {
+          height.toDouble() / width.toDouble()
         }
+      if (wideMode && ratio > PageSplitter.MAX_WIDE_RATIO) continue
+      val matches =
+        if (useRatio) {
+          ratio >= request.minRatio!!
+        } else if (wideMode) {
+          width >= effectiveMinWidth && width > height
+        } else {
+          width >= effectiveMinWidth || height >= effectiveMinHeight
+        }
+      if (!matches) continue
+      if (!includeIgnored && Pair(candidate.bookId, candidate.pageNumber) in ignoredKeys) continue
 
-      if (hasOversizedPages) {
-        try {
-          val result =
-            pageSplitter.splitTallPages(
-              book,
-              maxHeight = effectiveMaxHeight,
-              maxRatio = effectiveMaxRatio,
-              mode = splitMode,
-            )
-          if (result.success && result.pagesSplit > 0) {
-            ignoredOversizedPageRepository.deleteByBookIdAndMode(book.id, normalizedMode)
-          }
-          results.add(result.toDto())
-        } catch (e: Exception) {
-          results.add(
-            SplitResultDto(
-              bookId = book.id,
-              bookName = book.name,
-              pagesAnalyzed = 0,
-              pagesSplit = 0,
-              newPagesCreated = 0,
-              success = false,
-              message = "Error: ${e.message}",
-            ),
+      pagesByBook.getOrPut(candidate.bookId) { mutableSetOf() }.add(candidate.pageNumber)
+    }
+
+    val results = mutableListOf<SplitResultDto>()
+    for ((bookId, pageNumbers) in pagesByBook) {
+      val book = bookRepository.findByIdOrNull(bookId) ?: continue
+      try {
+        val result =
+          pageSplitter.splitTallPages(
+            book,
+            maxHeight = effectiveMaxHeight,
+            maxRatio = effectiveMaxRatio,
+            mode = splitMode,
+            pageNumbers = pageNumbers,
           )
+        if (result.success && result.pagesSplit > 0) {
+          ignoredOversizedPageRepository.deleteByBookIdAndMode(book.id, normalizedMode)
         }
+        results.add(result.toDto())
+      } catch (e: Exception) {
+        results.add(
+          SplitResultDto(
+            bookId = book.id,
+            bookName = book.name,
+            pagesAnalyzed = 0,
+            pagesSplit = 0,
+            newPagesCreated = 0,
+            success = false,
+            message = "Error: ${e.message}",
+          ),
+        )
       }
     }
 

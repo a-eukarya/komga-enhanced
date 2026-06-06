@@ -6,6 +6,530 @@ For upstream Komga changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## [0.1.5] - 2026-06-06
+
+### Fix: PageSplitter race condition destroyed CBZ files under concurrent `/split-all` calls
+
+`OversizedPagesController.splitAllTallPages` had no concurrency guard — two HTTP requests (browser double-click on `Split All`, or a Tomcat-side retry after a slow first request) entered `splitTallPages` in parallel for the same book. The splitter writes through three filesystem steps:
+
+1. `Files.copy(book.path, backupPath, REPLACE_EXISTING)` → creates `<name>_backup.cbz`.
+2. Builds `<name>_split.cbz` from page bytes.
+3. `book.path.deleteIfExists()` → `Files.move(tempPath, book.path, REPLACE_EXISTING)` → `backupPath.deleteIfExists()`.
+
+Two threads interleaving over these steps produce three different data-loss paths:
+- Thread A finishes step 3 (move + backup cleanup) → Thread B is mid-write on its own `<name>_split.cbz`, hits `book.path.deleteIfExists()` against A's freshly-moved file and `Files.move` fails because A's backup is gone → catch block can't restore → **file vanishes**.
+- Thread A's `<name>_split.cbz` move succeeds and Thread B's later `Files.copy(book.path, backupPath, REPLACE_EXISTING)` overwrites the backup with the **already-split** content; if B then fails partway, restore brings back the split version, not the original.
+- Both threads write to the same `<name>_split.cbz` → inflater sees mismatched deflate block lengths → `java.util.zip.ZipException: invalid stored block lengths` → file written successfully looks like a CBZ but cannot be unzipped → Komga shows "media type is not supported" / "Unknown error while getting book's entries".
+
+Concrete fallout (2026-06-04 user incident): ~360 `Failed to split pages in book` errors in `komga.log` over a single run; 710 CBZ paths recorded with `NoSuchFileException` and at least 6 with `Error reading Zip content` across the user's library. Affected series included `Tomb Raider King`, `Magic Emperor`, `Moe and Friends`, `ReadManga.Today`, `White Cloud Pavilion`, `Paragon Scans`, `White Devil scans`, `Akuzenai Arts`, `Mangasushi`, `ManhwaFreak`, `Roselia Scanlations`. Many of the lost chapters are from dropped scanlations not re-downloadable from any source.
+
+A per-book lock is now held for the entire `splitTallPages` invocation:
+
+- `PageSplitter.companion` holds `ConcurrentHashMap<String, Any>` keyed by `bookId`. Every entry into `splitTallPages` does `synchronized(bookLocks.computeIfAbsent(book.id) { Any() })` before any filesystem operation. Concurrent calls for the **same** book queue and run serially; calls for different books still run in parallel.
+- The lock is intentionally a **wait**, not a fail-fast (no 409, no early `SplitResult(success=false)`). When a user selects 150 pages in the UI, `splitSelected` iterates books in a sequential `await` loop — backend lock acquisition is instant in that case. If a retry or a second `Split All` arrives it queues behind the active job instead of starting a second iteration that could touch the same book.
+- The pre-existing exception handler that restores from `<name>_backup.cbz` on any mid-write failure is unchanged.
+
+Plus frontend disable: both top-level `Split Selected` / `Split All` buttons in `OversizedPages.vue` and the final `Split All` button inside the confirmation dialog now carry `:disabled="splitting"` (in addition to the existing `:loading="splitting"`, which on Vuetify 2 does not disable the button). Double-click and click-during-job no longer fire a second HTTP request.
+
+The split itself is unchanged. There is no migration; existing damaged CBZs are not recoverable by this fix.
+
+### Fix: Oversized-pages listing made N×3 single-row DB queries per request, fronted timed out as 500s
+
+`GET /api/v1/media-management/oversized-pages` walked `bookRepository.findAll()` and for every book issued three round-trips: `mediaRepository.findByIdOrNull` (pages join → MEDIA_PAGE), `seriesRepository.findByIdOrNull`, `seriesMetadataRepository.findByIdOrNull` (latter expands internally to five sub-queries — genres, tags, sharing labels, links, alternate titles). For a 3000-book library that's ~21000 individual SQL round-trips per filter/sort/page click. The endpoint also re-ran the entire scan for every search keystroke and pagination change since there was no caching. Browsers hitting it during a parallel `splitAllTallPages` (which itself occupies Tomcat exec threads with its own `findAll` walk) timed out at the Axios layer and surfaced in the UI as "An error occurred while trying to retrieve oversized pages" / `Request failed with status code 500`.
+
+A new `MediaRepository.findAllOversizedPageCandidates(minDimension)` performs a single JOIN over `MEDIA_PAGE → BOOK ← SERIES ← SERIES_METADATA`, pre-filtered by `WIDTH >= MIN_VALID_DIMENSION AND HEIGHT >= MIN_VALID_DIMENSION`. Each row already carries `bookId`/`bookName`/`seriesId`/`seriesName`/`seriesTitle`/`pageNumber` (mapped from the 0-based `MEDIA_PAGE.NUMBER` to the 1-based UI page number) plus dimensions, size, and mediaType. `OversizedPagesController.getOversizedPages` consumes that flat list and does the ratio / wide / search / ignored filtering and pagination in memory — same semantics as before, but the database side collapses from O(books × 3) round-trips to one statement. `seriesRepository` and `seriesMetadataRepository` are removed from the controller constructor since they were only used by this endpoint.
+
+### Fix: `Split All` ignored the active UI filter, processed the whole library
+
+`POST /api/v1/media-management/oversized-pages/split-all` walked `bookRepository.findAll()` and only honoured `mode` + `maxHeight`/`maxRatio` from the request body. The UI's `search`, `includeIgnored` and `minRatio`/`minWidth`/`minHeight` filters that scoped the visible listing (`getOversizedPages`) were never sent and never read. Clicking `Split All` after filtering for one series ran the split across the entire library — the same iteration that triggered the race in the fix above, but also a UX trap: users assumed they were splitting what they could see.
+
+`SplitRequestDto` now carries `search`, `includeIgnored`, `minWidth`, `minHeight`, `minRatio`. `splitAllTallPages` runs the same candidate-filtering pipeline as the listing endpoint — one `findAllOversizedPageCandidates` bulk query, then ratio/wide/mode/search/ignored filtering in memory — and builds a `Map<bookId, Set<pageNumber>>` of pages that actually match the current view. It then calls `pageSplitter.splitTallPages(book, …, pageNumbers = matchingPages)` once per book. The explicit `pageNumbers` set short-circuits the per-page ratio re-check inside `PageSplitter` (see `PageSplitter.kt:88`: *"If an explicit page set was provided, only split those pages"*) so what gets split is exactly what was on screen, no more no less.
+
+`splitAll()` in `OversizedPages.vue` now sends `search: this.searchQuery`, `includeIgnored: this.includeIgnored`, `minRatio: this.detectRatio` alongside `mode`/`maxRatio`.
+
+#### Modified files (covers the three oversized-pages fixes above)
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/PageSplitter.kt` | `companion` holds `ConcurrentHashMap<String, Any>` keyed by `bookId`. `splitTallPages` wraps the filesystem-touching body in `synchronized(bookLocks.computeIfAbsent(book.id) { Any() })`; the body itself moved into a private `runSplit` helper. `java.util.concurrent.ConcurrentHashMap` import added. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/persistence/MediaRepository.kt` | New `findAllOversizedPageCandidates(minDimension: Int): Collection<OversizedPageCandidate>`. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/jooq/main/MediaDao.kt` | Implementation: single JOIN over `MEDIA_PAGE → BOOK ← SERIES ← SERIES_METADATA` with `WIDTH/HEIGHT >= minDimension` predicate, maps to `OversizedPageCandidate` rows. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/model/OversizedPageCandidate.kt` | New flat data class carrying the joined columns (bookId/bookName/seriesId/seriesName/seriesTitle/pageNumber/width/height/fileSize/mediaType). |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/dto/OversizedPageDto.kt` | `SplitRequestDto` gains 5 optional fields: `search`, `includeIgnored`, `minWidth`, `minHeight`, `minRatio`. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/OversizedPagesController.kt` | `getOversizedPages` now calls `mediaRepository.findAllOversizedPageCandidates(PageSplitter.MIN_VALID_DIMENSION)` and iterates the flat list directly. `splitAllTallPages` rewritten to run the same candidate-filtering pipeline (bulk query → ratio/wide/mode/search/ignored filter → `Map<bookId, Set<pageNumber>>`) and call `splitTallPages` once per book with the explicit `pageNumbers` set; old `bookRepository.findAll()` + per-book `media.pages.any` scan removed. `seriesRepository` and `seriesMetadataRepository` constructor parameters removed (no other callers). |
+| `komga-webui/src/views/OversizedPages.vue` | Three buttons gain `:disabled="splitting"`: top `Split Selected`, top `Split All`, confirm-dialog `Split All`; confirm-dialog button additionally gains `:loading="splitting"`. `splitAll()` POST body extended with `search`/`includeIgnored`/`minRatio` from current UI state. |
+
+### Fix: Re-inject ComicInfo fix overwrote non-MangaDex ComicInfo.xml
+
+`repairMissingComicInfo` (`Settings → Fixes → Re-inject ComicInfo.xml`) walks every series folder that is MangaDex-tracked — both UUID-named directories and name-based directories whose `series.json` carries `comicid`/`mangadex.org/title/…` — and re-writes the ComicInfo.xml of every CBZ inside, matching files by chapter number from the filename. With `force=true` the only guard was the ZIP-comment presence check, which a non-MangaDex source CBZ does not satisfy. CBZs that the user had hand-copied from another source (mangabuddy, cubari, Mihon exports) into a MangaDex-tracked series folder were silently rewritten — their original `<Series>`, `<Number>`, `<Web>` and Mihon `<ty:…>` tags were lost, and downstream metadata refreshes then carried the MangaDex chapter UUID instead of the source URL.
+
+Re-inject now reads `<Web>` from the existing ComicInfo before doing anything else. If `<Web>` is present and does not contain `mangadex.org`, the file is left alone and counted as `skipped` — even under `force=true`. The check runs ahead of the ZIP-comment short-circuit so non-MangaDex CBZs are protected against accidental force-runs. CBZs with no ComicInfo or with a MangaDex `<Web>` continue to be repaired as before.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/ComicInfoGenerator.kt` | New `readWebUrl(cbzFile)` — same shape as `readChapterNumber`, extracts `<Web>` via regex with `DOT_MATCHES_ALL`. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` | `repairMissingComicInfo` calls `readWebUrl` first and `continue`s with `skipped++` when the URL is present and not `mangadex.org`. |
+
+### Fix: PageSplitter parallel image decodes exhausted JVM heap
+
+The per-book lock added by the race-condition fix above prevented two threads from corrupting the *same* book, but did not cap simultaneous splits across *different* books. A user-triggered `Split All` run kicked off 10+ Tomcat exec threads, each holding its own page in memory as a `BufferedImage` (width × height × 4 bytes). Webtoon pages routinely run into hundreds of MB per decode; the heap exhausted within seconds and the OOM cascade killed the JVM — every stack trace ended in `JPEGImageReader.read` → `DataBufferByte.<init>`.
+
+A global `Semaphore(MAX_PARALLEL_SPLITS = 2)` in `PageSplitter.companion` now caps simultaneous splits across all books. `splitTallPages` acquires it around the per-book `synchronized(lock)` block, so concurrent splits on the *same* book still queue on the per-book lock (no behaviour change), but concurrent splits on *different* books are throttled to 2 — enough to keep the pipeline moving without pushing the heap over the edge. The acquire is a blocking wait, not a tryAcquire, so a Tomcat thread that would have started the third split sits idle until one of the active two finishes; this matches the existing UX of `splitSelected` which already iterates books sequentially.
+
+### Fix: SQLite RO pool starved under concurrent reads, now tracks `taskPoolSize`
+
+When the JVM came back up from the OOM described above, the browser frontend immediately reloaded every visible view, queueing dozens of simultaneous read-requests against `SqliteMainPoolRO`. Hikari ran the pool at `total=1, active=1, idle=0` with every waiting request timing out at 30 s. From the user perspective the server was unresponsive even though it was back up.
+
+Two root causes stacked:
+
+1. `KomgaProperties.Database.maxPoolSize` defaults to `1` — even with a host that gives `availableProcessors() = 8`, the existing `coerceAtMost(maxPoolSize)` clipped the pool back to 1.
+2. There was no way to raise the RO pool from the running UI; tuning required editing `application.yml` and restarting.
+
+The RO pool now mirrors the `/settings/server` → "Task threads" setting (`KomgaSettingsProvider.taskPoolSize`). Initial sizing during bean construction stays at `availableProcessors().coerceAtMost(maxPoolSize)` (the existing fallback) because the settings DB isn't readable yet — the pool has to come up before `KomgaSettingsProvider` can be queried. Once Spring fires `ApplicationReadyEvent`, `DataSourcesConfiguration` reads `taskPoolSize` and runtime-resizes the HikariCP pool via `HikariDataSource.maximumPoolSize = N`. A `@EventListener(SettingChangedEvent.TaskPoolSize)` repeats the same resize whenever the user changes the value in the UI, so the running server picks it up without a restart.
+
+Sizing is skipped when `komga.database.poolSize` is set explicitly (user opted out of dynamic sizing) or when `shouldSeparateReadFromWrites()` returns false (RO pool falls back to the RW pool which is locked at 1 by SQLite write semantics anyway). The write pool stays at 1 unconditionally.
+
+`KomgaSettingsProvider` is injected via `ObjectProvider<>` to avoid the circular dependency (the provider reads from `serverSettingsDao`, which depends on the very RW data source built by this configuration).
+
+**Why upstream kept these two pools separate.** `maxPoolSize = 1` was introduced in `76e62414` (Jul 2022, *fix: add configuration to set the database pool size*) together with the optional `poolSize: Int? = null` — at that point SQLite ran without WAL, every read serialized behind every write, and a connection pool larger than 1 deadlocked the JDBC driver. The `1` is historical "fixed pool size", not a deliberate ceiling. Read/write split arrived later in `f9d9139b` (*perf: separate database reads from writes*), but only activates under WAL; the default-1 ceiling stayed for backward compatibility with non-WAL setups. `taskPoolSize` itself landed independently in `9ef319b7` (*feat(api): configure number of task processing threads*) as background-job concurrency at the application layer — semantically separate from DB pooling at the infrastructure layer, so neither commit had a reason to wire them together. In practice the layers are coupled: every task thread eventually issues SQL, and `taskPoolSize=N` against `poolSize=1` queues all N tasks single-file through one connection regardless of WAL. The fork wires them. Per-connection cost (~50KB heap + one WAL snapshot) is negligible, and the RO pool is capped at exactly `taskPoolSize` so the user's "Task threads" slider stays the single knob.
+
+### Fix: ComicInfo inject re-deflated already-compressed page images on every write
+
+`injectComicInfo` and `injectComicInfoWithRetry` rewrote the CBZ by copying every source entry through `ZipOutputStream` at its default DEFLATE level. JPEG, PNG, and WebP page images are already compressed; running them through deflate a second time yields ~0% size reduction (often a few bytes *more* due to deflate framing overhead) at significant CPU cost — measured 3-5× the wall-time of a STORED copy. The slowdown matters most when the Settings → Fixes → "Re-inject ComicInfo.xml" job sweeps the whole library: a full sweep over a sizeable collection ran for hours and blocked other inject work behind the global ZIP-rewrite contention.
+
+Image entries (`.jpg .jpeg .png .webp .gif .avif .heic`) are now written as `ZipEntry.STORED` with `size`, `compressedSize`, and `crc` lifted directly from the source `ZipEntry` in the central directory. ComicInfo.xml and any non-image entries (`series.json`, embedded fonts, ...) continue to be DEFLATED at the default level. No source bytes are re-read or re-hashed; the STORED path is a straight `InputStream.copyTo` once `putNextEntry` has accepted the pre-known CRC.
+
+Failsafe: STORED is unforgiving — if the source central-dir CRC or size is wrong, `ZipOutputStream.closeEntry` throws `ZipException` and the entire output stream is dead. Both inject paths handle that explicitly:
+
+- `injectComicInfo`: refactored into a thin wrapper around a private `writeInjected(useStored: Boolean)`. The outer method runs `writeInjected(useStored=true)` and, on `ZipException`, logs a warning and runs `writeInjected(useStored=false)` against a fresh temp file. The original CBZ is never touched until `Files.move` succeeds on the second pass; if both passes fail the inject is a no-op and the original CBZ is left intact.
+- `injectComicInfoWithRetry`: `var useStored = true` lifted to the outer scope of the retry loop. On `ZipException` the flag flips to `false` and the next loop iteration writes DEFLATED. `FileSystemException` keeps its existing exponential sleep; `ZipException` does not consume the retry sleep budget (it's a code-path retry, not a lock-contention retry).
+
+### Feature: ChapterMatcher accepts `Chapter <num>` and `Chapter_<num>` prefixes
+
+`ChapterMatcher` was matching `c<num>` (gallery-dl default template) or `ch. <num>` only. Users who wanted to pick a more human-readable `chapter_naming` template like `Chapter {chapter:>03}` were blocked by the plugin description's hard warning that ChapterMatcher would no longer find the CBZ for post-download ComicInfo injection — the immediate consequence being that the `<Number>` tag never lands in the CBZ, so the resume path (`GalleryDlWrapper.kt:520`, `comicInfoGenerator.readChapterNumber`) cannot tell the chapter is finished and re-downloads it on every restart.
+
+A third regex `chapterNumChapterRegex = ^chapter[\s_]+(\d+(?:\.\d+)?)` is added alongside the C-prefix and Ch-prefix variants. `extractChapterNumberFromFilename`, `extractChapterNumFromFilename`, and `matchesChapterNumber` all probe it (after the existing two) so existing libraries with `c<num>` filenames keep their fast path. The plugin field's WARNING is dropped and the description lists the three accepted prefixes (`c<num>`, `ch. <num>`, `Chapter <num>`).
+
+### Fix: ChapterMatcher dropped letter-suffix chapters (`5.5a`, `5.5b`) causing post-download CBZ matching to fail
+
+Source-side chapter numbers like `5.5a` / `5.5b` (MangaDex convention for split releases of the same decimal chapter — e.g. KittyBlue9 / Aesthethicc scans of `My Wife is from a Thousand Years Ago`) round-tripped through gallery-dl as the literal string `"5.5a"` and produced an on-disk filename `v1 c005.5a [KittyBlue9 Scans].cbz` from the default `c{chapter}` template. Two downstream paths broke:
+
+1. **Post-download CBZ matching** (`GalleryDlWrapper.kt:841`). After each per-chapter `gallery-dl` invocation the wrapper enumerates the destination directory and tries to find the just-written CBZ to inject ComicInfo and run cleanup. The lookup keys are `paddedChapter = chapterMatcher.padChapterNumber(chapterStr)` and the raw `chapterStr`. `padChapterNumber` called `chapterNumStr.toDouble()` which throws `NumberFormatException` on `"5.5a"` — the catch returned the input unchanged, so `paddedChapter == chapterStr == "5.5a"`. `matchesChapterNumber` then probed the candidate name `c005.5a [kittyblue9 scans]` for `startsWith("c5.5a ")` / `startsWith("c5.5a-")` etc. — none matched (`c005.5a` ≠ `c5.5a`). The CBZ was downloaded successfully but the wrapper logged `Could not find CBZ file for chapter 5.5a (expected c5.5a or c5.5a)` (note the doubled echo, a direct symptom of the failed padding) and skipped ComicInfo injection. Resume then could not see a `<Number>` tag and re-downloaded the chapter on the next run.
+
+2. **Resume false-positive skip** (`ChapterMatcher.extractChapterNumberFromFilename`). The three regexes capture-grouped `^c(\d+(?:\.\d+)?)` / `^ch\.?\s*(\d+(?:\.\d+)?)` / `^chapter[\s_]+(\d+(?:\.\d+)?)` — letter suffix is dropped. A library with both `c005.5a` and `c005.5b` extracted as `5.5` twice; the resume `Set<String>` thus contained one entry instead of two, and the next-not-yet-downloaded probe in `GalleryDlWrapper.download` considered MangaDex's `5.5a` AND `5.5b` "already on disk" after only one of them was fetched, skipping the second.
+
+**Fix in `ChapterMatcher.kt`:**
+
+- All three prefix regexes get an optional trailing `[a-z]?` inside the capture group: `^c(\d+(?:\.\d+)?[a-z]?)` etc. Single lowercase letter — matches MangaDex convention (`a`, `b`, `c`) without expanding scope to arbitrary suffixes.
+- `padChapterNumber` is rewritten to split the input on a new private regex `chapterNumericSplitRegex = ^(\d+(?:\.\d+)?)([^\d.].*)?$`. The numeric prefix is padded with `String.format("%03d…")` as before; the suffix (`a`, `b`, …) is appended unchanged. Inputs without a leading numeric prefix bypass the try-block entirely instead of throwing — eliminates the spurious `Could not pad chapter number` debug-log path for non-numeric inputs.
+- `<Number>5.5a</Number>` flows through Komga's existing BookMetadata parser unchanged (`numberSort = 5.5`, `number = "5.5a"`) — no Komga-side changes needed for sort/display correctness.
+
+**Fix in `GalleryDlWrapper.kt:863`:** the warn message now collapses to `expected c<padded>` when `paddedChapter == chapterStr`, avoiding the misleading doubled-echo that masked this bug for weeks.
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/ChapterMatcher.kt` | Three prefix regexes gain `[a-z]?` suffix capture; `padChapterNumber` splits numeric prefix from alpha suffix, pads only the numeric part; new private `chapterNumericSplitRegex` companion. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` | "Could not find CBZ" warn collapses doubled `c$padded or c$chapterStr` echo when both strings are equal. |
+
+### Performance: SQLite pragma set tuned for a 768 MB multi-tab library DB
+
+`application.yml` pins three pragmas per DB that together replace the SQLite embedded-defaults assumed for a single-user single-connection app:
+
+- **`busy-timeout: 30s`** (both `komga.database` and `komga.tasks-db`). Default is 0 ms — any lock-contention surfaces as immediate `SQLITE_BUSY`. With WAL + the dynamic RO pool, lock-contention is short (write-pool=1) but real; 30 s lets the JDBC driver retry transparently instead of bubbling `SQLITE_BUSY` up to `TaskHandler`.
+- **`synchronous: NORMAL`** (both DBs). Default is `FULL` — fsync on every transaction commit. `NORMAL` fsyncs only at WAL-checkpoint boundaries, ~3-5× faster on bulk writes (library scan, mass-rehash, Re-inject sweep). The trade-off: on power-loss the last ~1 s of commits may be lost; **no corruption** (WAL guarantees the file stays consistent).
+- **`cache_size: 2000`** (`komga.database` only — `tasks-db` is small and doesn't benefit). Positive = pages × `page_size=4096` = 8 MB per connection (default `-2000` = 2 MB). 8 MB holds the working set of the dominant indexes (BOOK, BOOK_METADATA, MEDIA_PAGE, SERIES, SERIES_METADATA) for the lifetime of the connection. At pool size 8 (mirrors `taskPoolSize`, see "SQLite RO pool tracks /settings/server") that totals 64 MB committed — negligible against the JVM's `-Xmx3g`. With the read-pool dynamic, the 2 MB default evicted hot pages within milliseconds and every additional connection re-walked the B-trees from disk on each query burst.
+
+The pragmas are injected by `DataSourcesConfiguration.buildDataSource` as URL parameters on the SQLite JDBC URL. The separator is `?` for the first pragma and `&` for subsequent ones — `buildDataSource` checks whether `databaseProps.file` already contains a `?` (in-memory test DBs use `file:database?mode=memory`) and picks the right separator. Without the check, the in-memory test path produced the invalid URL `file:database?mode=memory?synchronous=NORMAL`, breaking `DataSourcesConfigurationTest > MemoryMode`.
+
+| File | Change |
+|------|--------|
+| `komga/src/main/resources/application.yml` | `komga.database.busy-timeout: 30s` + `pragmas.synchronous: NORMAL` + `pragmas.cache_size: 2000`. `komga.tasks-db` gets `busy-timeout: 30s` + `pragmas.synchronous: NORMAL` (no `cache_size`). |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/datasource/DataSourcesConfiguration.kt` | `buildDataSource` picks the URL-pragma separator (`?` or `&`) based on whether `databaseProps.file` already contains a `?` — required for the in-memory test DB URL to stay valid when pragmas are appended. |
+
+### Fix: `TaskHandler` propagated `SQLITE_BUSY` to ERROR instead of retrying
+
+`busy-timeout: 30s` (above) handles the common case at the JDBC driver level — the driver waits up to 30 s for the lock to clear. But the timeout is per-statement: a write that *enters* the busy state right at the 30 s ceiling still throws `SQLiteException(SQLITE_BUSY)`, and `TaskHandler.handleTask` previously logged this as a generic task failure and bumped the failure counter, even though the task's logical work hadn't failed at all.
+
+`handleTask` now wraps `runTask(task)` in a retry loop scoped to `SQLiteException` with `resultCode == SQLITE_BUSY`. `MAX_DB_BUSY_RETRIES = 5` with linear backoff (`DB_BUSY_BACKOFF_MS * attempt`, starting at 500 ms — 500 ms, 1 s, 1.5 s, 2 s, 2.5 s). All other exceptions propagate immediately as before. With the 30 s busy-timeout, a single retry should suffice in practice — the loop is defensive for edge cases (concurrent VACUUM, WAL checkpoint stall under heavy load).
+
+The pre-existing `catch (Exception)` blocks *inside* `runTask` were removed: exceptions now propagate up to `handleTask`, which is the single point that decides retry-vs-fail-final. Previously, swallowed exceptions inside `runTask` masked the underlying `SQLITE_BUSY` from the new retry logic.
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/application/tasks/TaskHandler.kt` | `handleTask` wraps `runTask` in a retry loop guarded by `SQLiteException(SQLITE_BUSY)` with linear backoff. `MAX_DB_BUSY_RETRIES = 5`, `DB_BUSY_BACKOFF_MS = 500L` companion constants. Inner `runTask` catches removed so the exception path is centralised. |
+
+### Performance: Docker image layer-split — typical fork-version pulls drop from ~200 MB to ~10-25 MB
+
+`Dockerfile.tpl` previously installed system packages (`apt-get install …`), kepubify, and gallery-dl in a single `RUN` step. `release.yml` passes `ARG GALLERY_DL_REV=${{ github.run_id }}-${{ github.run_attempt }}` so every release-rebuild invalidates the layer's cache (intentional — gallery-dl is pinned to a commit-SHA tarball per build, BuildKit's wheel-cache would otherwise freeze an old SHA). Consequence: each new fork-version release shipped a fresh ~150-180 MB layer; clients pulling the update re-downloaded the whole stack.
+
+Split into two `RUN` steps. **Layer 1** = `apt-get install … && curl-fetch kepubify` (stable, cached across rebuilds because the input — `gradle.properties`'s base + Kepubify-version — rarely changes). **Layer 2** = `pip3 install gallery-dl-komga` gated by `ARG GALLERY_DL_REV`. Per-release the invalidated layer is only the small Python install (~5-15 MB compressed); the apt + kepubify layer stays cached on both the build host and the client pull. Client-side delta drops to ~10-25 MB.
+
+Trade-off: the prior `apt-get purge curl` was removed because purging in Layer 2 would create filesystem whiteouts that bloat the layer. `curl` stays in the final image (~10 MB), accepted as the cost of the much-larger per-release delta savings.
+
+| File | Change |
+|------|--------|
+| `komga/docker/Dockerfile.tpl` | Single `RUN` split into two: Layer 1 (`apt-get install … && curl/tar kepubify`) and Layer 2 (`ARG GALLERY_DL_REV` + `pip3 install gallery-dl-komga`). `apt-get purge curl` removed. |
+
+### Fix: state-altering download events were logged at DEBUG/INFO and disappeared under the default WARN level
+
+The fork pins `org.gotson.komga: WARN` as the baseline log level (see "log-level persists across restarts" below). Several auto-blacklist / auto-retry / stale-recovery events that change persistent state — and that an operator must see in order to understand later behaviour — were emitted at DEBUG or INFO and therefore vanished on the default install.
+
+- `GalleryDlWrapper.autoBlacklistDuplicates` → `logger.warn` (same-group duplicate blacklist insertion).
+- `GalleryDlWrapper` chapter loop → `logger.warn` for `Auto-blacklisted external redirect` (pages=0 MangaDex external chapter) and `Auto-blacklisted chapter after N failed attempts`.
+- `GalleryDlWrapper.repairMissingComicInfo` → `logger.warn` for the per-file `skip … existing ComicInfo Web is non-MangaDex` decision, so the user-triggered repair shows in the log exactly which files were left alone and why.
+- `DownloadExecutor.recoverStaleDownloads` → `logger.warn` for both `Recovering N stale DOWNLOADING entries from previous run` and per-entry `Reset to PENDING …`. This event only fires when the previous JVM died mid-download; operator visibility is mandatory.
+- `DownloadExecutor.autoRetryFailedDownloads` → `logger.warn` for the batch-trigger and per-entry `Auto-retry queued …`. Distinguishes server-initiated retry from user-initiated retry (`retryDownload(id)` remains INFO).
+
+User-initiated subprocess-kill / cancel / pause / delete / resume stays at INFO — those are routine UI actions and surface in the UI itself, not a log anomaly.
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` | 4 log statements elevated from DEBUG/INFO to WARN (auto-blacklist × 3, repair-skip × 1). |
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | 4 log statements elevated from INFO to WARN (stale recovery × 2, auto-retry batch + per-entry). |
+
+### Feature: gallery-dl plugin exposes a FlareSolverr URL
+
+Cloudflare-protected manga sites (mgeko.cc, mangaclash.com, deatte5.com, tritinia.org, manhwatop.com) cannot be fetched by gallery-dl's requests-based session — the server returns the Cloudflare challenge HTML and gallery-dl reports HTTP 403 or an empty page. The companion gallery-dl-komga fork now supports a FlareSolverr endpoint that solves the challenge in a headless Chrome session and hands back the resulting cookies plus the User-Agent that solved them (cf_clearance is bound to the UA that issued it; restoring cookies without restoring the UA invalidates the clearance). Per-host cookies + UA are cached on disk for 20 minutes so subsequent runs go direct; the FlareSolverr round-trip only kicks in on a Cloudflare challenge or a cold cache.
+
+The Komga plugin config gains an optional `flaresolverr_url` string field (Settings → Plugins → Configure gallery-dl Downloader). When non-blank, `GalleryDlProcess.createTempConfigFile` writes it into the generated gallery-dl JSON config as `extractor.flaresolverr`. The extractor-side parsing and cache lives in the gallery-dl-fork; see its CHANGELOG.
+
+#### Modified files (covers the five fixes above)
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/PageSplitter.kt` | **In addition to** the per-book lock from the race-condition fix above: `companion` gains `MAX_PARALLEL_SPLITS = 2` and `globalSplitSemaphore: Semaphore`. `splitTallPages` acquires the semaphore around the existing per-book `synchronized(lock)` block, releases in `finally`. `java.util.concurrent.Semaphore` import added. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/datasource/DataSourcesConfiguration.kt` | `KomgaSettingsProvider` injected as `ObjectProvider<>` (lazy, breaks the circular settings-DB dependency). New `@EventListener` handlers for `ApplicationReadyEvent` + `SettingChangedEvent.TaskPoolSize` call a private `resizeRoPool()` that sets `HikariDataSource.maximumPoolSize = taskPoolSize`. Skipped when `database.poolSize` is set explicitly or RO/RW pools aren't separated. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/ComicInfoGenerator.kt` | **In addition to** the `readWebUrl` helper from the Re-inject fix above: new `companion` `IMAGE_EXTS` list + private `copyEntry(zin, source, zout, useStored)` helper. `injectComicInfo` body extracted to private `writeInjected(useStored)`; outer method runs STORED, catches `ZipException`, retries DEFLATED on a fresh temp file. `injectComicInfoWithRetry` lifts `useStored` to the loop scope and flips it on `ZipException`. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/ChapterMatcher.kt` | New `chapterNumChapterRegex`. `extractChapterNumberFromFilename`, `extractChapterNumFromFilename`, and `matchesChapterNumber` updated to also accept `Chapter NNN` and `Chapter_NNN`. |
+| `komga/src/main/kotlin/org/gotson/komga/application/startup/PluginInitializer.kt` | `chapter_naming` description rewritten (WARNING dropped, lists three accepted prefixes). New `flaresolverr_url` field in the gallery-dl plugin schema. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlProcess.kt` | `createTempConfigFile` reads `pluginConfig["flaresolverr_url"]` and, when non-blank, sets `extractor.flaresolverr` in the generated gallery-dl JSON config. |
+
+### Fix: COMPLETED downloads showed `-` after a page reload
+
+Symptom: a completed download (reported by the user against *I Started Working a Housekeeping Job…*, one chapter, MangaDex `ad75039d-686c-457f-b478-e56fc3b3c069`) rendered `COMPLETED  100%  -` after reloading the Download Manager page. Live progress arrives over the WebSocket stream so the row's chapter count is visible mid-session, but a reload refetches the queue through the REST API, which returns whatever is persisted in the `DOWNLOAD_QUEUE` row.
+
+The COMPLETED handler called `updateDownloadStatus` with `status`, `progressPercent`, `completedDate`, and `destinationPath` only — `totalChapters` and `currentChapter` were never written back. If the listing call at queue-creation time had not populated `totalChapters` (the row's only earlier chance), the DB stayed `null` even when `result.filesDownloaded` reported the actual number. `Downloads.vue` then evaluated `v-if="item.totalChapters"` → false → the caption rendered blank.
+
+Both fields are now persisted:
+
+- `finalTotalChapters = download.totalChapters ?: result.filesDownloaded.takeIf { it > 0 }` — keeps the listing-reported count when present, otherwise falls back to what was actually downloaded.
+- `finalCurrentChapter = result.filesDownloaded.takeIf { it > 0 } ?: finalTotalChapters` — non-null current count for the frontend's `N/M` template.
+
+They go into the `download.copy(…)` passed to `updateDownloadStatus` (so the DB row carries them post-reload) and into the `completed` WebSocket broadcast (so live-streamed UIs match the post-reload state).
+
+Existing COMPLETED rows are *not* migrated — they were persisted with `null` before this fix and remain blank after the upgrade. Verification requires a new download (live chapter release).
+
+Frontend caption switched from `N chapters` to `{currentChapter || totalChapters}/{totalChapters} chapters`, matching the existing DOWNLOADING `N/M` style. Both the mobile card layout and the desktop `v-data-table` render the new format.
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | COMPLETED handler computes `finalTotalChapters` and `finalCurrentChapter` from the download row and `result.filesDownloaded`. Both are written into the `download.copy(…)` passed to `updateDownloadStatus` (DB row) and into the WebSocket `completed` payload's `totalChapters`/`completedChapters`. |
+| `komga-webui/src/views/Downloads.vue` | COMPLETED caption switched from `{totalChapters} chapters` to `{currentChapter || totalChapters}/{totalChapters} chapters` in both the mobile card and the desktop `v-data-table`. |
+
+### Fix: page-thumbnail generation exhausted the JVM heap on webtoon-sized images
+
+A user-driven series scroll triggered a wave of `OutOfMemoryError: Java heap space` from `ImageConverter.resizeImageToByteArray`, every stack ending in `Thumbnailator.ProgressiveBilinearResizer.resize` → `BufferedImageBuilder.build` → `DataBufferInt.<init>`. The frontend was requesting page thumbnails for a webtoon series (1500×30000 px pages), and `Thumbnails.of(...).size(...)` decoded each source into a full `BufferedImage` (≈180 MB at width×height×4 bytes) before downsampling. A handful of concurrent thumbnail requests therefore allocated multiple hundred-MB images on the heap at once and the JVM ran out of room despite `-Xmx3g`.
+
+Two changes in `ImageConverter`:
+
+- `resizeImageBuilder` now performs a **subsampled pre-decode**: when the source's longest edge is at least 2× the target thumbnail size, an `ImageReader` is opened against an `ImageInputStream` and `ImageReadParam.setSourceSubsampling(factor, factor, 0, 0)` is applied — the reader skips every Nth pixel during decompression, so a 1500×30000 webtoon at `factor = max/edgeTarget = 50` decodes to ~30×600 instead of the full surface. The pre-decoded `BufferedImage` is re-encoded once via `bufferedImageToBytes` and the resulting bytes flow into the existing `Thumbnails.of(InputStream)` path so all four callers (`BookAnalyzer`, `BookLifecycle` thumbnail + page thumbnail, `MosaicGenerator`) get the smaller pre-image without touching their call sites. `bufferedImageToBytes` returns `null` when `ImageIO.write` reports `false` or produces an empty buffer (writer not registered, e.g. WebP without TwelveMonkeys); the resize path then falls through to the original `imageBytes` so the format-incompatible case degrades cleanly instead of throwing `UnsupportedFormatException` downstream. Subsampling itself is skipped entirely when `format.imageIOFormat` is not in `supportedWriteFormats`, so a format we cannot re-encode after pre-decode is never decoded subsampled in the first place.
+
+- A companion `decodeSemaphore = Semaphore(MAX_PARALLEL_DECODES = 2)` wraps every entry into `resizeImageToByteArray` and `resizeImageToBufferedImage`. Two simultaneous full decodes is the safety cap if the subsampled path is skipped (small source, unsupported writer); the third request blocks until one of the active decodes releases. This is symmetric to the per-process `globalSplitSemaphore` from the PageSplitter fix and keeps the absolute worst-case decode count bounded even when subsampling does nothing.
+
+The reader endpoint that streams the original page bytes (`getBookPageByNumber`) does not go through `ImageConverter` and is untouched — original-quality page rendering is unchanged.
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/image/ImageConverter.kt` | `companion` adds `MAX_PARALLEL_DECODES = 2` + `decodeSemaphore`. `resizeImageToByteArray` and `resizeImageToBufferedImage` acquire the semaphore around the existing body. New private `decodeSubsampled` (opens an `ImageReader`, sets source subsampling, decodes once) and `bufferedImageToBytes` (nullable, guards against silent `ImageIO.write` failures). `resizeImageBuilder` only runs the pre-decode path when the source is at least 2× the target edge and the source format is in `supportedWriteFormats`; otherwise it falls back to streaming `imageBytes` straight into `Thumbnails.of`. `java.util.concurrent.Semaphore` import added. |
+
+### Fix: SQLite "no such table: temp_xxx" errors after the RO pool grew past one connection
+
+Once the RO pool stopped being pinned at 1 (the previous fix), browser pages started failing with `SQLiteException: SQL error or missing database (no such table: temp_0QKJ4SR1JMGN4)` for any DAO that batches large IN-list queries — `BookDao.findBySeriesIds`, `BookDtoDao.findAllByBookIds`, ReadList / Sidecar / SeriesMetadata aggregations. The Komga DAO pattern wraps the IN clause through `TempTable.withTempTable(...)`:
+
+1. `CREATE TEMPORARY TABLE temp_<tsid> (STRING varchar NOT NULL)` is executed.
+2. `INSERT INTO temp_<tsid> VALUES (?), (?), ...` follows in batches.
+3. The outer query joins / selects with `WHERE … IN (SELECT STRING FROM temp_<tsid>)`.
+4. `close()` issues `DROP TABLE IF EXISTS temp_<tsid>`.
+
+SQLite's `TEMPORARY` keyword scopes the table to the connection that created it — once the RO pool can hand each `dsl.execute(...)` / `dsl.batch(...)` / `dsl.select(...)` call a different Hikari connection, only step 1 sees the table. Steps 2-4 land on a connection where the temp table never existed and fail.
+
+The table is now created without the `TEMPORARY` keyword so it lives in the regular schema and is visible to every connection in the pool. Names are TSID-generated (`temp_<TsidCreator.getTsid256()>`) so there is no collision risk between concurrent callers. The existing `close()` already drops the table when the `Closeable` exits its `.use { ... }` block, so the worst-case leak (process killed mid-operation) is a single orphan table with a stable schema, which can be cleaned by `VACUUM` or recreated by `flyway:repair` if it ever became noisy.
+
+Other approaches considered and rejected:
+
+- Wrap each `withTempTable(...)` in a jOOQ `transactionResult { … }` so the same connection holds the whole sequence. Correct but requires touching 36 call sites across 10 DAOs, and forces them all into the same transaction boundary which would also serialize reads behind any RW activity on the writer connection.
+- Connection-pinning via HikariCP's `beginRequest()` hooks. Less invasive at call sites but the configuration scope leaks beyond the temp-table use case and silently re-pins reads in unrelated parts of Komga.
+
+The current change is two characters at the SQL level (`CREATE TEMPORARY TABLE` → `CREATE TABLE`) and leaves the public API of `TempTable` unchanged.
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/jooq/TempTable.kt` | `create()` issues `CREATE TABLE` (not `CREATE TEMPORARY TABLE`). No other behavioural change. |
+
+### Feature: log-level persists across restarts, dual Debug/Info toggle, default WARN
+
+Komga shipped with `logging.level.root` left at Spring Boot's default of `INFO`, so `BookLifecycle`, `TaskHandler`, hashing, and similar bookkeeping logged at INFO and rapidly filled `komga.log`. The `/settings/logs` page exposed a single `Debug` toggle that wrote DEBUG or INFO into the running `LoggerContext` only — both the YAML-configured baseline and the toggle's runtime override were lost on restart.
+
+Three coordinated changes:
+
+- `application.yml` pins `org.gotson.komga: WARN` so a fresh install starts quiet by default. Library-level loggers (`org.apache.activemq.audit`, `org.springframework.security.config…`) keep their existing per-package overrides.
+- `LogController.setLogLevel` accepts `DEBUG / TRACE / INFO / WARN / ERROR`, normalises unknown values to `WARN`, calls a private `applyLogLevel` that sets the level on **both** the `ROOT` logger and the `org.gotson.komga` package logger, and writes the final level into `KomgaSettingsProvider.logLevel` (new `LOG_LEVEL` enum entry; default `WARN`). Flipping the YAML-pinned `org.gotson.komga` logger as well as ROOT is what makes the toggle actually switch the noisy Komga-internal loggers — otherwise the runtime ROOT change is shadowed by the package-level YAML override and the user sees no effect.
+- `LogController.restoreLogLevelFromSettings` is an `@EventListener(ApplicationReadyEvent::class)` that reads the persisted level and re-applies it once the settings DAO is available. Persistence flows the same path as `taskPoolSize` (`KomgaSettingsProvider` → `serverSettingsDao.saveSetting/getSettingByKey`).
+- `LogsView.vue` now renders **two** mutually-exclusive switches:
+  - `Debug` (when ON, the other goes OFF, `/api/v1/logs/level?level=DEBUG`)
+  - `Info` (when ON, the other goes OFF, `/api/v1/logs/level?level=INFO`)
+  Both OFF resolves to `WARN`. `fetchLogLevel` maps the server's reply back onto the two switches (`DEBUG`/`TRACE` → Debug on; `INFO` → Info on; anything else → both off).
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `komga/src/main/resources/application.yml` | `logging.level.org.gotson.komga: WARN` added. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/configuration/KomgaSettingsProvider.kt` | New `var logLevel: String` (default `WARN`) backed by `serverSettingsDao`. `LOG_LEVEL` enum entry added. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/LogController.kt` | New constructor dep on `KomgaSettingsProvider`. `setLogLevel` accepts five levels (DEBUG/TRACE/INFO/WARN/ERROR), normalises to `WARN`, applies on ROOT + `org.gotson.komga`, persists via `settingsProvider.logLevel = …`. Restore-on-boot intentionally lives outside this controller (see `LogLevelInitializer` below) because the class-level `@PreAuthorize("hasRole('ADMIN')")` would otherwise reject any `@EventListener` method invoked without a Security context. |
+| `komga/src/main/kotlin/org/gotson/komga/application/startup/LogLevelInitializer.kt` (new) | `@Component` with `@EventListener(ApplicationReadyEvent)` `restoreLogLevelFromSettings` — reads `settingsProvider.logLevel` and applies it to ROOT + `org.gotson.komga` loggers. Lives outside `LogController` so it inherits no Security annotations; without this split the listener fires under an empty `SecurityContext` and Spring Security's `AuthorizationManagerBeforeMethodInterceptor` throws `AuthenticationCredentialsNotFoundException`, which was masked by `ApplicationReadyEvent` swallowing listener exceptions (the level silently stayed at the Spring Boot default `INFO`, so the LogsView toggle always reported Info=ON after a restart even when the user had switched it off, and every `@SpringBootTest` failed initialization). |
+| `komga-webui/src/views/LogsView.vue` | Single Debug switch replaced by two mutually-exclusive switches (`Debug`, `Info`). Default-both-off resolves to `WARN`. `fetchLogLevel` maps server reply back onto both states; `applyLogLevel` posts `WARN`/`INFO`/`DEBUG` depending on which toggle is on. |
+
+### Fix: `Download Manager` chapter counter showed pre-existing CBZ files as "newly downloaded"
+
+A user-reported regression on a 1-chapter download against *Reborn as a Space Mercenary* showed `COMPLETED  100%  109 / 109` mid-session and `COMPLETED  100%  135 / 135` after a reload — neither number was the actual fresh chapter count (1). The mid-session number was the MangaDex series total carried from `mangaInfo.totalChapters` at queue time; the post-reload number was `result.filesDownloaded`, which `GalleryDlWrapper.download` populated by listing **every** CBZ in `destDir` after the gallery-dl run finished. For a resume that started in a folder with 134 already-complete CBZs and added one new one, that count was 135 and there was no way to distinguish "new this run" from "total in folder".
+
+`DownloadResult` gains a `newlyDownloaded: Int = filesDownloaded` field. The two success-return paths in `GalleryDlWrapper.download` compute it as `(downloadedFiles.size - existingCbzCountAtStart).coerceAtLeast(0)`, where `existingCbzCountAtStart` is sampled once at the top of `download()` before any gallery-dl process starts. On a fresh download (`existingCbzCountAtStart = 0`) it equals `filesDownloaded`; on a resume that adds N chapters it is exactly N. `DownloadExecutor.processDownload` then uses `result.newlyDownloaded` (not `result.filesDownloaded`) for both `finalTotalChapters` and `finalCurrentChapter`, so the persisted DB row and the `completed` WebSocket payload both carry the run-scoped count. Reloading the page after a 1-chapter download now renders `1/1 chapters`.
+
+The fallback to `download.totalChapters` is kept for the degenerate case where `newlyDownloaded` is 0 (resume hit an entirely full archive and gallery-dl downloaded nothing) — without it the COMPLETED row would render blank in that scenario.
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` | `download()` samples `existingCbzCountAtStart` before the gallery-dl process starts. `DownloadResult` gains `newlyDownloaded: Int = filesDownloaded` (defaulted so older constructor sites keep compiling). Both success returns set `newlyDownloaded = (downloadedFiles.size - existingCbzCountAtStart).coerceAtLeast(0)`. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | **In addition to** the COMPLETED `-` fix above: the COMPLETED handler uses `result.newlyDownloaded` (not `result.filesDownloaded`) when computing `finalTotalChapters` and `finalCurrentChapter`. |
+
+### Feature: per-series "Add Chapter Download" with custom filename, chapter number, and ComicInfo overrides
+
+For series whose source uploads arrive as single-shot manga (filename and chapter number from the source don't fit the rest of the series), the existing download pipeline left no way to fix the destination filename and `ComicInfo.xml` chapter number without touching the CBZ manually after the fact. The new feature adds a "Add Chapter Download…" item to the `SeriesActionsMenu` 3-dot menu; the dialog supports two modes:
+
+- **Single Chapter** — paste a chapter URL, optionally toggle `Use custom naming` (default ON). With custom naming on, `Filename` and `Chapter #` become required (`Volume` and `Chapter Title` stay optional). The submit posts a regular `POST /api/v1/downloads` payload extended with the overrides.
+- **Series + Range** — paste the series URL and a chapter range string (`20-30` or `20,22,25`, mixable as `1-5,10,12-14`). Per-chapter overrides are not available in range mode; gallery-dl + komga-PP produce the CBZ naming and ComicInfo tags as usual, but the skip-check below still applies per chapter. The range is plumbed through to `GalleryDlWrapper.download(chapterRange = …)` and applied two ways: (1) for non-MangaDex bulk runs the range is translated to a gallery-dl `--chapter-filter` expression (`(chapter >= a and chapter <= b) or chapter == n`), so the extractor itself drops out-of-range chapters before any image fetch; (2) for MangaDex runs the wrapper's own per-chapter iteration filters `filteredChapters` with `chapterMatchesRange(number, range)` before the loop, and the resume input file (`-i` path) is filtered the same way. Both paths share one parser so the user-visible syntax is identical regardless of source.
+
+A `Skip if file exists` toggle (default ON) compares against existing chapter numbers in the target series **via the database**, not via filename. On submit, before the download starts, `DownloadExecutor.processDownload` loads `BookMetadata.numberSort` for every book in the target `seriesId` and short-circuits to `COMPLETED` with `errorMessage = "Chapter X already exists in series"` if a match is found. Filename-based skip would have missed duplicate chapters that were uploaded under wildly different filenames (single-manga uploads, scanlator naming variations) — the database number is authoritative.
+
+After a successful download in custom-naming mode, the COMPLETED handler calls `applyChapterOverrides`:
+
+1. The first CBZ in `result.downloadedFiles` is renamed to `customFilename` (the `.cbz` suffix is added if missing) via `Files.move(REPLACE_EXISTING)`.
+2. `patchComicInfo` opens the renamed CBZ, reads the existing `ComicInfo.xml` (or seeds an empty one if absent), upserts `<Number>` / `<Volume>` / `<Title>` with the user's values, and writes the result back through a fresh `ZipOutputStream` with the ZIP comment preserved. `upsertTag` replaces the existing tag if present and inserts it before `</ComicInfo>` otherwise; XML special characters in the user input are entity-encoded.
+3. Any failure inside `applyChapterOverrides` is caught and logged at WARN — the download is still marked COMPLETED so the user can recover manually rather than seeing a transient FAILED state.
+
+The library-scan trigger that runs at the end of every COMPLETED download remains unchanged, so the renamed-and-patched CBZ is picked up automatically.
+
+The overrides themselves are serialised to `DownloadQueue.metadataJson` via Jackson (`ChapterDownloadOverrides`), so they survive server restart and the recovery path in `recoverStaleDownloads`. `DownloadCreateDto.toOverrides()` returns `null` when none of the override fields are set, so the standard non-custom download path stays a no-op against the new code.
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/dto/DownloadDto.kt` | `DownloadCreateDto` gains six optional fields (`seriesId`, `chapterRange`, `customFilename`, `customChapterNumber`, `customVolume`, `customChapterTitle`) + `skipIfChapterExists: Boolean = true`. New `toOverrides()` returns `ChapterDownloadOverrides?` (null when no override field is set). |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/DownloadController.kt` | `createDownload` forwards `create.toOverrides()` to `downloadExecutor.createDownload`. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | New constructor deps on `BookRepository` and `BookMetadataRepository`. `createDownload` accepts `overrides: ChapterDownloadOverrides?` and serialises it into `metadataJson` via Jackson. `processDownload` runs a pre-download skip-check (loads `BookMetadata.numberSort` for the target series and short-circuits to COMPLETED if `customChapterNumber` matches), then forwards `overrides?.chapterRange` to `galleryDlWrapper.download(chapterRange = …)`. After a successful download, `applyChapterOverrides` renames the produced CBZ and `patchComicInfo` upserts `<Number>`/`<Volume>`/`<Title>` in `ComicInfo.xml`. New top-level `ChapterDownloadOverrides` data class at the end of the file. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/GalleryDlWrapper.kt` | **In addition to** the `newlyDownloaded` field from the chapter-counter fix above: new optional `chapterRange: String? = null` parameter on `download()`. When set, `parseChapterRangeToFilter` translates the range into a gallery-dl `--chapter-filter` expression that is appended to the base command (covers non-MangaDex bulk runs); the MangaDex per-chapter iteration filters `filteredChapters` via `chapterMatchesRange(Double, String)`; the resume-mode `-i` input file filters `galleryDlChapterMap.values` the same way. Both helpers parse a shared syntax (`a-b`, `n`, comma-separated mix). |
+| `komga-webui/src/components/menus/SeriesActionsMenu.vue` | New `Add Chapter Download…` menu item → dispatches `dialogAddChapterDownload`. |
+| `komga-webui/src/components/dialogs/AddChapterDownloadDialog.vue` | New dialog (fullscreen on `xsOnly`, `max-width: 600` on desktop). `v-btn-toggle` for `Single Chapter` / `Series + Range`. Range mode hides custom-naming fields. Custom-naming switch (default ON) gates the required `Filename` + `Chapter #` rules and the optional `Volume` + `Chapter Title`. `Skip if file exists` switch (default ON) with hint about DB-based comparison. Submit POSTs to `/api/v1/downloads` with the overrides. |
+| `komga-webui/src/components/ReusableDialogs.vue` | `AddChapterDownloadDialog` wired in (component import + registration, computed `addChapterDownloadDialog` get/set bridging the Vuex store, computed `addChapterDownloadSeries` getter). |
+| `komga-webui/src/store.ts` | New state (`addChapterDownloadDialog: false`, `addChapterDownloadSeries: undefined`), mutations (`setAddChapterDownloadDialog`, `setAddChapterDownloadSeries`), and actions (`dialogAddChapterDownload(series)`, `dialogAddChapterDownloadDisplay(value)`). |
+
+### Fix: MangaDex Subscription feed dropped chapters whose follows-feed indexing lagged
+
+`MangaDexSubscriptionSyncer.checkFeed` queried `/user/follows/manga/feed` with `publishAtSince=<last_check_time>` and set `last_check_time` to "now" after every run — a strict, non-overlapping window. MangaDex's `/user/follows/manga/feed` index is not updated synchronously with chapter `publishAt`, and the lag can be hours, not minutes. Concrete losses: `04e8da87-599f-42be-b70f-9e86a84168e8` (publishAt 2026-06-03 13:14:03 UTC, sync at 13:15 returned "no new chapters"), `89749c2e-3cde-491b-9a3c-66d32c47d116` (same date, same pattern), and `836fa090-984c-4bbb-9127-5599d34a7d9d` (publishAt 2026-06-05 12:35:17 UTC, still missing from the follows-feed 2.5h later despite being live on `/manga/{id}/feed` and the mangadex.org "Latest Updates" UI — this chapter is at `version: 3`, suggesting the server-side `publishAtSince` filter may also drop chapters that get re-versioned post-publish).
+
+The query no longer relies on the server-side `publishAtSince` filter at all. The feed is now fetched with `order[publishAt]=desc`, no date filter, plus `includeFuturePublishAt=0` and `includeEmptyPages=0` so scheduled or zero-page entries never enter the pipeline. Each chapter's `publishAt` is parsed client-side via `OffsetDateTime.parse(...).toInstant()` and compared against a 24h-earlier cutoff derived from the stored `last_check_time`; pagination breaks at the first chapter older than the cutoff. Typical run is one page; the wide lookback exists purely to outlast the follows-feed indexing lag. Already-queued chapters are still deduped by `isChapterKnown` against `chapter_url` + blacklist tables, so the wider window never re-queues a download.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/MangaDexSubscriptionSyncer.kt` | `checkFeed` parses `last_check_time` into an `Instant` and computes a 24h-earlier client-side cutoff. The feed URL drops `publishAtSince`, sets `order[publishAt]=desc`, adds `includeFuturePublishAt=0` + `includeEmptyPages=0`. Per-chapter loop parses `publishAt` with `OffsetDateTime.parse(...).toInstant()` and breaks pagination at the first chapter older than the cutoff. New `OffsetDateTime` import. |
+
+### Feature: `/settings/updates` shows a `gallery-dl-fork` tab on commit basis
+
+The companion `gallery-dl-komga` fork does not bump a version string — only the upstream `gallery-dl` version it tracks does. Existing GitHub-release-based update detection therefore can't tell whether the running container is current. The Updates page gains a third tab that compares the installed gallery-dl-fork commit SHA against the latest commits on `https://github.com/08shiro80/gallery-dl-komga` and lists everything in between.
+
+How the installed SHA is captured: the multi-stage `Dockerfile.tpl` resolves the head of `master` via the GitHub API at build time, writes the resolved SHA to `/opt/gallery-dl-fork-sha`, then installs `pip3 install … archive/${SHA}.tar.gz` (instead of `archive/refs/heads/master.tar.gz`) so the file and the actually-installed code are guaranteed to match. The runtime reads that file via `ReleaseController.readInstalledGalleryDlSha()`; if it doesn't exist (older image, local-dev builds) the tab degrades to an "Installed SHA unknown" chip and still shows the commit list.
+
+`python3-pip` was previously stripped from the runtime image via `apt-get purge --auto-remove`. That is reverted, because the Update tab surfaces a copy-able `docker exec -u 0 komga sh -c "pip3 install … archive/<SHA>.tar.gz && echo <SHA> > /opt/gallery-dl-fork-sha"` one-liner — the user runs it from the docker host as root (Komga itself runs 1000:1000 and can't write to system `site-packages`), and `pip3` has to exist inside the container for that to work. After the manual update the SHA file is overwritten by the same command, so the next page refresh shows "Up to date" without restarting the container.
+
+Backend: `ReleaseController.getGalleryDlForkUpdates` fetches `https://api.github.com/repos/08shiro80/gallery-dl-komga/commits?per_page=30` (cached 15min in a second Caffeine cache, separate from the existing release cache), computes `behindCount` as the index of the installed SHA in the commit list (or `-1` if the SHA file is missing), and maps each commit to `{sha, shortSha, message, author, date, url, installed}`.
+
+Frontend: a third `v-tab` on `UpdatesView.vue` shows the installed SHA chip, a `behind by N commits` warning, the copy-command, and the commit list with the matching commit flagged as `Installed`. The "new updates" warning badges in the side navigation and home page footer (`HomeView.vue:299` + `:392`) now also light up on `isGalleryDlForkUpToDate() == 0`, so the user sees the alert without opening the Updates page.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/docker/Dockerfile.tpl` | Resolves the gallery-dl-fork `master` HEAD via the GitHub commits API at build time, writes the SHA to `/opt/gallery-dl-fork-sha`, then installs the matching tarball (`archive/${GALLERY_DL_SHA}.tar.gz` instead of `archive/refs/heads/master.tar.gz`). `apt-get purge` no longer removes `python3-pip` — kept so the user can `docker exec -u 0 komga pip3 install …` to update without a full image rebuild. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/ReleaseController.kt` | New `getGalleryDlForkUpdates` endpoint (`GET /api/v1/releases/gallery-dl-fork`). Adds a second 15-min Caffeine cache for commit responses (separate from the existing 1h release cache because commits move faster than releases). `readInstalledGalleryDlSha()` parses `/opt/gallery-dl-fork-sha`, accepts 7–64 char hex (covers short, full, and abbreviated SHA forms). `fetchGitHubCommits` is the commit-list equivalent of the existing `fetchGitHubReleases`. New `Files`/`Path` imports. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/dto/GalleryDlForkUpdateDto.kt` (new) | `GalleryDlForkUpdateDto` (envelope), `GalleryDlForkCommitDto` (frontend-facing per-commit row), plus three `@JsonIgnoreProperties(ignoreUnknown = true)` GitHub commit-API parsing types (`GithubCommitDto` / `GithubCommitDetails` / `GithubCommitAuthor`). |
+| `komga-webui/src/types/release.ts` | New `GalleryDlForkCommitDto` and `GalleryDlForkUpdateDto` interfaces. |
+| `komga-webui/src/services/komga-releases.service.ts` | New `getGalleryDlForkUpdates()` calling `GET /api/v1/releases/gallery-dl-fork`. |
+| `komga-webui/src/store.ts` | New `galleryDlForkUpdates` state (nullable), new `isGalleryDlForkUpToDate()` getter returning `1` / `0` / `-1` to match the existing `isLatestVersion`/`isForkLatestVersion` ternary, new `setGalleryDlForkUpdates` mutation. |
+| `komga-webui/src/views/UpdatesView.vue` | Third `v-tab` "gallery-dl-fork" with installed-SHA chip, behind-count chip, copy-command panel, and the commit list. `data.copied`, computed `updateCommand` building the `docker exec -u 0 komga sh -c "pip3 install … archive/<SHA>.tar.gz && echo <SHA> > /opt/gallery-dl-fork-sha"` snippet from the freshest commit SHA, and `copyUpdateCommand` writing to the clipboard. `loadData()` now also calls `getGalleryDlForkUpdates()` with a fallback that commits `{installedSha: null, behindCount: -1, commits: []}` on failure so the tab still renders an "unknown" state. Scoped `.update-cmd` style. |
+| `komga-webui/src/views/HomeView.vue` | The two `v-badge` warnings (`:299` side-nav "Updates" link and `:392` footer version label) now also fire on `isGalleryDlForkUpToDate() == 0`. `loadData()` calls `getGalleryDlForkUpdates()` so the badge lights up without requiring a visit to the Updates page first. |
+
+### Fix: Add-Chapter-Download created a new manga folder instead of writing into the opened series
+
+`processDownload` derived the destination folder purely from the MangaDex UUID embedded in the URL: chapter-URLs (`mangadex.org/chapter/<id>`) have no manga UUID, so `extractMangaDexId` returned `null`, the wrapper fell through to the non-MangaDex `libraryPath.resolve(sanitizeFileName(title))` branch and created a fresh folder named after the chapter's series-title (e.g. `"The Angel Next Door Spoils Me Rotten After the Rain/"`) — duplicating an existing Komga series (`Otonari no Tenshi-sama…/`) and leaving the user with two split folders for the same title.
+
+**Why:** the user explicitly invokes Add-Chapter-Download from inside a series, so the target is unambiguous and shouldn't depend on URL-shape detection. `processDownload` now resolves `overrides.seriesId` (forwarded by `DownloadCreateDto.toOverrides()`) to the actual Series row, sets `destinationPath = Paths.get(overridesSeries.url.toURI())` and `komgaSeriesId = overridesSeries.id`, **before** the existing mangaDex-id / fallback branches. The two existing branches stay as-is for the URL-only paths (subscription queue, follow.txt). Works for any URL shape — MangaDex chapter URLs, MangaDex title URLs, non-MangaDex chapter URLs — because the destination is now driven by the user's UI-selected series, not by parsing the URL.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | **In addition to** the Add-Chapter-Download wiring above: new `overridesSeries` lookup (`overrides?.seriesId?.let { seriesRepository.findByIdOrNull(it) }`) right before the mangaDexId / fallback branches; when non-null, `destinationPath` is set from `overridesSeries.url.toURI()` and `komgaSeriesId` from `overridesSeries.id`. Logs `Add-Chapter-Download targets existing series <name> (<path>)`. |
+
+### Fix: Subscription auto-queued dead mangas (no en chapters) endlessly
+
+`MangaDexSubscriptionSyncer.checkForNewManga` queued a `createDownload` for every newly followed manga without first verifying the manga has any downloadable chapters in the user's language. For manga whose follows-feed entry exists but whose `/manga/{id}/feed?translatedLanguage[]=en` returns empty (only non-en chapters, only `externalUrl != null` chapters, or `pages: 0`) the wrapper logged `MangaDex chapter API returned empty for <id>, skipping bulk download` and skipped — but never added the manga to Komga's series-table, so `seriesRepository.findByMangaDexUuid(mangaId) != null` was `false` on every subsequent run, the syncer requeued the same manga, the wrapper skipped again, ad infinitum (concrete loop: `2f90e7e5-16b4-41f5-b717-137cf9783b5b`).
+
+**Why not just blacklist the manga:** the user explicitly rejected a permanent-disable approach because later chapters may become available (en-translation added, externalUrl-chapter republished without external pointer). The right gate is "does the manga have at least one downloadable chapter right now?" — re-evaluated every sync.
+
+New `hasDownloadableChapters(mangaId, language, token)` helper calls `/manga/{id}/feed?translatedLanguage[]=<lang>&includeFuturePublishAt=0&includeEmptyPages=0&includeExternalUrl=0&limit=1` and inspects `total`. If the response is non-200 or the parse fails the result defaults to `true` (do not skip on transient API errors — better one redundant download attempt than a silently dropped manga). `checkForNewManga` calls the helper between the `isUrlAlreadyQueued` check and `createDownload`, skips with a debug log if false.
+
+A second cleanup in the same file: the language was looked up in two places via the same inline `pluginConfigRepository.findByPluginIdAndKey(... "default_language")?.configValue ?: "en"` snippet. Both call sites now share a private `resolveLanguage()` helper that **drops** the `?: "en"` fallback and throws `IllegalStateException("gallery-dl plugin default_language not configured")` instead — the field is always populated in practice (subscription syncer also no-ops when gallery-dl plugin is disabled), so a missing-value here means the config row has been wiped and silently substituting "en" would mask the misconfiguration.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/MangaDexSubscriptionSyncer.kt` | **In addition to** the follows-feed lag fix above: new `resolveLanguage()` and `hasDownloadableChapters(mangaId, language, token)` private helpers. `checkForNewManga` calls `hasDownloadableChapters` between `isUrlAlreadyQueued` and `createDownload`; both call sites for the plugin's `default_language` config-key go through `resolveLanguage()` (no fallback, throws on missing). |
+
+### Feature: `/media-management/analysis` gains Verify / Repair / Rescan actions and persistent ERROR-flagging for corrupt CBZs
+
+`/media-management/analysis` rendered an empty list because no path in Komga ever set `Media.Status.ERROR` for CBZs that became corrupt **after** their initial analyze (e.g. truncated by an interrupted write, central-directory mismatch from a PageSplitter race, SMB partial-write). Initial `BookAnalyzer.analyze` does flag corrupt-on-first-open files (catch-all `catch (Exception)` → `ERR_1005`), but that only fires for `UNKNOWN`/`OUTDATED` books — once a book is `READY`, subsequent `RemoveHashedPages` runs throwing `ZipException` propagated to `TaskHandler` as a generic ERROR log without persisting any flag, so the spam continued every scheduled scan and the user had no UI signal that the file was actually broken.
+
+Three new pieces solve the loop and surface the result:
+
+1. **Passive flag at read-time** — `BookPageEditor.removeHashedPages` and `deletePages` wrap the rewrite block (now under `CbzSafeWriter`, see below) with `catch (ZipException)` that updates `Media.Status.ERROR` once (idempotent) with `comment = "Corrupt CBZ: <message>"` and returns null. The early `if (media.status == ERROR) { logger.debug(...); return null }` guard then prevents the next scheduled run from even trying — the log goes from N×stack-trace per book to one debug line.
+
+2. **Active scan on demand** — `IntegrityController` (`api/v1/media-management/integrity/`) gains `POST verify`: a single-thread `Executors.newSingleThreadExecutor()` iterates all `.cbz`/`.zip` books via `bookRepository.findAll()`, opens each with `ZipFile`, iterates every entry and reads every byte. Each book gets a **two-pass read with a 2 s sleep between passes** (`VERIFY_RETRY_DELAY_MS`); a book is only flagged when **both** passes fail. The retry suppresses false positives from transient I/O (HDD bad-sector retry, file-handle race against a concurrent write); recovered-on-retry events log at INFO. Counters `processed/total/flagged` are `AtomicInteger`. AtomicBoolean lock returns 409 if already running. `GET status` exposes counters for the live progress bar; for the flagged-count it queries `mediaRepository.countByStatus(ERROR)` instead of the in-memory counter when no scan is running, so the count survives container restart.
+
+3. **Repair without re-download** — `POST repair` runs `zip -FF <src> --out <tmp>` on each ERROR-flagged book. For "central-directory corrupt, data intact" cases this recovers all entries; the result is verified by re-opening with `ZipFile` and counting entries against the pre-repair central-dir count. Fully recovered → `Files.move` overwrites the original, status flipped to `OUTDATED` so Komga's regular `analyzeBook` picks it up and promotes it back to `READY`. Partial → tmp deleted, comment updated to `"Partial repair: N/M entries — needs re-download"`, status stays ERROR. Timeout (10 min/file) and exit-code failures count as `failed`. `zip` package added to the runtime image (`Dockerfile.tpl`) because the multi-stage build previously didn't include it.
+
+4. **Rescan-flagged** — `POST rescan` filters books with `status == ERROR` and emits one `Task.AnalyzeBook` per book via `taskEmitter.analyzeBook(book)`. Used after a Repair-Partial or after the user externally fixed a file on disk: forces Komga to re-evaluate one shot instead of waiting for the next library scan. Returns `{queued: N}` for the UI snackbar; the actual progress is visible via the existing task-queue indicator in the nav-bar (see "global background-job indicator" below).
+
+The frontend wires three buttons under the existing status filter: `Verify ZIP integrity` (always present), `Repair flagged (N)` and `Rescan flagged (N)` (visible only when `verifyFlagged > 0`). Live counters poll `/status` every 3s while either verify or repair is in-progress and stop polling when both flags clear; on poll-stop the table reloads so newly-fixed books vanish from the ERROR list. The pre-mount fetch ensures progress is visible immediately if a scan started before the user opened the page.
+
+#### Modified / new files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/BookPageEditor.kt` | Both rewrite paths (`removeHashedPages`, `deletePages`) wrap the ZIP-write block with `catch (ZipException)` → flag `Media.Status.ERROR` with `comment = "Corrupt CBZ: <msg>"` and `return null`. Pre-flight: `if (media.status == ERROR) { logger.debug(...); return null }` short-circuits future runs on the same book, replacing the previous `MediaNotReadyException` throw that produced WARN-level log spam. New `java.util.zip.ZipException` import. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/IntegrityController.kt` (new) | `POST verify` / `POST repair` / `POST rescan` / `GET status`. `verify`: single-thread executor iterates books and reads every byte of every entry. `repair`: spawns `zip -FF` subprocess per book, verifies entry-count, replaces atomically when fully recovered (status → OUTDATED for re-analyze). `rescan`: emits `Task.AnalyzeBook` per ERROR book via `taskEmitter`. `status` returns in-memory counters during a running scan but falls back to `mediaRepository.countByStatus(ERROR)` when idle so the badge survives container restart. AtomicBoolean locks for verify and repair (separate slots). `BackgroundJobTracker` integration so the actions surface in the global nav-bar indicator. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/persistence/MediaRepository.kt` | New `fun countByStatus(status: Media.Status): Long`. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/jooq/main/MediaDao.kt` | Impl `dslRO.fetchCount(m, m.STATUS.eq(status.name)).toLong()`. |
+| `komga/docker/Dockerfile.tpl` | `apt-get install` list now includes `zip` (alongside `python3 python3-pip` for the gallery-dl Update-Page repair). Without it the `zip -FF` subprocess on the repair path would fail with `executable file not found in $PATH`. |
+| `komga-webui/src/views/MediaAnalysis.vue` | Three buttons under the existing status filter row (`Verify`, `Repair`, `Rescan` — last two conditionally on `verifyFlagged > 0`). Live counter `{processed}/{total} checked · {flagged} flagged` for verify; `Repair: {processed}/{total} · fixed N · partial K · failed M`. Single polling loop covers both verify and repair via `refreshVerifyStatus`. `rescanFlagged` posts and pops a snackbar with the queued count; `loadBooks` re-runs after 2 s so the table loses the just-fixed rows. Mount hook fetches `/status` so progress is visible immediately after a page reload. |
+
+### Feature: global background-job indicator (`nav-bar TaskQueueStatus` SSE includes custom long-running operations)
+
+The existing `taskCount` indicator in the side-navigation only reflected the `tasksRepository` (Komga's regular task queue). Long-running actions launched via separate executors — Split-All (`OversizedPagesController`), Verify Integrity (`IntegrityController.verifyAll`), Repair (`IntegrityController.repairAll`) — were invisible in the nav-bar progress bar even though they could run for an hour. Users had to keep the originating page open to know anything was happening.
+
+A new `BackgroundJobTracker` Spring `@Component` holds a `ConcurrentHashMap<String, Boolean>` of active job-names. The three custom controllers call `tracker.start("Job Name")` / `tracker.stop("Job Name")` in their try/finally. `SseController.taskCount()` (scheduled `@Scheduled(fixedRate = 10_000)`) now emits `backgroundJobs: List<String>` alongside the existing `count` / `countByType`; the frontend store mutates `state.backgroundJobs`, `HomeView.vue` ORs `taskCount > 0` with `backgroundJobs.length > 0` on the linear progress-bar `:active` binding and adds a `Background:` block in the tooltip listing the active job names. 10 s refresh matches the existing taskCount cadence; jobs that finish between ticks are picked up at the next tick.
+
+Adding a new long-running action in the future means two lines (`tracker.start("Name")` + `tracker.stop("Name")` in `try`/`finally`) — no SSE or UI changes needed.
+
+#### Modified / new files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/background/BackgroundJobTracker.kt` (new) | `@Component` with `ConcurrentHashMap<String, Boolean>`; `start(jobName)`, `stop(jobName)`, `snapshot(): Map<String, Boolean>`. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/sse/dto/TaskQueueSseDto.kt` | Added `backgroundJobs: List<String> = emptyList()` (default keeps the DTO source-compatible for any consumers parsing without the new field). |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/sse/SseController.kt` | Constructor takes `BackgroundJobTracker`; `taskCount()` builds the SSE payload with `tracker.snapshot().keys.sorted()` so the order is stable across emissions. |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/OversizedPagesController.kt` | `splitAllTallPages` wraps the body in `tracker.start("Split All")` / `tracker.stop` in try/finally (in addition to the AtomicBoolean lock below). |
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/IntegrityController.kt` | `verifyAll` and `repairAll` both call `tracker.start(...)` / `tracker.stop(...)` around their executor submission (the executor itself does the in-finally stop because the request thread returns immediately). |
+| `komga-webui/src/plugins/komga-sse.plugin.ts` | Store state gains `backgroundJobs: [] as string[]`; `setTaskCount` mutation reads `event.backgroundJobs || []`. |
+| `komga-webui/src/views/HomeView.vue` | Linear progress bar `:active="taskCount > 0 || backgroundJobs.length > 0"`. Tooltip adds a `Background:` heading with one line per active job. New computed `backgroundJobs(): string[]`. |
+
+### Fix: `/media-management/oversized-pages` Split-All had no endpoint-level lock — double-click fanned out a second pass over the same library
+
+The 0.1.5 PageSplitter mutex (semaphore + per-book lock) serialised concurrent splits on the *same* book and capped total parallel splits at 2, but the `POST split-all` endpoint itself had no lock: a double-click from the UI (or two users on different tabs) triggered two synchronous loops over the same `pagesByBook` map, each acquiring the semaphore in turn and walking through every book again. Per-book serialisation prevented direct file corruption, but every book got split twice (the second pass found the now-shorter pages, re-applied the same threshold and produced a no-op `0 pagesSplit` result for most of them — but the wasted I/O blocked legitimate work for the duration of the entire second loop). On a 26 k-book library that's an extra ~30 minutes of pointless work plus a UX where the button reappeared "available" mid-run.
+
+**Why the request thread guard:** the user explicitly wanted the button to remain unclickable across a page reload — a client-side `splitting` boolean alone resets to `false` on every fresh mount. Server-side AtomicBoolean is the only way for tab N to know that tab M kicked off a run that's still running.
+
+`OversizedPagesController` gains a `private val splitAllInProgress = AtomicBoolean(false)`. `splitAllTallPages` does `compareAndSet(false, true)` before any work; if it fails the endpoint throws `ResponseStatusException(409, "Split-All operation already in progress")`. The actual loop is moved into `runSplitAll(request)` so the try/finally that resets the flag wraps the entire run. A new `GET split-all/status` returns `{inProgress: Boolean}` for the frontend mount hook: on page load `OversizedPages.vue` defaults `splitting = true` (button greyed), then calls `/split-all/status`; if the response is `inProgress: false` it flips to `false` (button re-enabled). If true, the existing 3 s polling loop reuses `pollSplitAllStatus` to keep the button disabled until the run finishes, then `loadPages()` refreshes the table. A 409 from a click is handled by switching to the same poll loop and surfacing a "Split-All läuft bereits — bitte warten" snackbar. The initial-true default prevents the brief enabled-flash between mount and the first `/status` response.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/interfaces/api/rest/OversizedPagesController.kt` | New `splitAllInProgress: AtomicBoolean`. `splitAllTallPages` does `compareAndSet`, throws 409 on collision, and wraps the renamed `runSplitAll(request)` in try/finally. New `GET split-all/status` → `{inProgress: Boolean}`. `tracker.start("Split All")` / `tracker.stop` for the global indicator. |
+| `komga-webui/src/views/OversizedPages.vue` | `data.splitting` defaults to `true` (button disabled until proven idle). `mounted()` calls `checkSplitAllStatusOnMount()` which queries `/status` and flips `splitting` to `false` only on confirmed `inProgress: false`. `splitAll()` catches 409, starts `pollSplitAllStatus()`. `pollSplitAllStatus()` polls every 3 s and refreshes `loadPages()` when the server reports `inProgress: false`. `beforeDestroy()` clears the interval. |
+
+### Feature: `CbzSafeWriter` — every CBZ-mutating path now writes through a single hardened pipeline
+
+Six paths could mutate a CBZ on disk: `PageSplitter.splitTallPages`, `BookPageEditor.removeHashedPages`, `BookPageEditor.deletePages`, `ComicInfoGenerator.writeInjected`, `ComicInfoGenerator.injectComicInfoWithRetry`, `DownloadExecutor.patchComicInfo`. Each had ad-hoc tmp-file handling — write to `tempFile`, `Files.move(REPLACE_EXISTING)`, a `finally { Files.deleteIfExists(tempFile) }` — and no post-write verification. A truncated network write to the SMB share, an exception mid-write, an interrupted process, or an SMB disconnect would leave the original replaced by an unreadable file, and the only signal was the `ZipException` thrown later when something tried to read the result. That accumulated 262 corrupt CBZs in the user's library (4 paths × hundreds of operations over months).
+
+**Why a single utility:** the user asked for "1000 failsafes" — six independent implementations would each need their own backup, verify, rollback, disk-space-check logic, and adding a new path later would require remembering all of them. One `CbzSafeWriter.safelyReplace(target, writeLambda)` ensures every mutation is bounded by the same guarantees.
+
+The pipeline per call — the original target file remains intact and readable until the final atomic swap. **Ordering is load-bearing:** the write-lambda is invoked while `target` is still the real file, because many callers re-read `target` inside the lambda (e.g. `BookPageEditor.removeHashedPages` reads `book.path` via `bookAnalyzer.getFileContent` to enumerate pages to drop). Backing up to `.bak` **before** running the lambda would mean the lambda sees an empty `target`, fails, rolls back from `.bak`, and (if the rollback itself fails on SMB) loses the file. The final order below avoids that class of failure entirely.
+
+1. **Disk-space check** — `Files.getFileStore(parent).usableSpace >= 2 × expected-size`. Half the safety margin is for the tmp-file, half is to ensure the rollback can re-write the original if needed.
+2. **RAM-build or disk-build via the write-lambda** — original < 100 MB → lambda writes to a `ByteArrayOutputStream` (in-RAM), original ≥ 100 MB → lambda writes to a disk-tmp. The threshold avoids OOM on huge webtoon CBZs while keeping the fast-path RAM-only for typical chapters. **Target is still intact at this point**, so the lambda can re-read it.
+3. **In-RAM verify** (RAM-pipeline only) — `ZipInputStream` over the bytes; iterate every entry, read every byte to EOF. Any `ZipException` here aborts before disk-write.
+4. **Disk-write to tmp** — `Files.write(tmp, bytes)` for RAM-pipeline; the lambda already wrote disk-tmp directly for the disk-pipeline.
+5. **Post-write verify on disk** — `ZipFile(tmp.toFile())` + iterate every entry + read every byte. Catches "RAM bytes were correct, but disk write was truncated by SMB disconnect". Empty result aborts.
+6. **Backup via `Files.move`** — original.cbz → `.bak.<uuid>`. Move (atomic on same-FS, copy+delete on SMB) avoids a wasteful per-CBZ data copy; at 150-chapter Split-All on a 50-200 MB-per-chapter library this saves ~15-30 GB of disk traffic per run. The target is only invisible to readers for the brief window between this step and the next.
+7. **Atomic rename** — `Files.move(tmp, target, ATOMIC_MOVE, REPLACE_EXISTING)` with fallback to `REPLACE_EXISTING`-only when the underlying filesystem doesn't support atomic moves (SMB falls back here).
+8. **Post-rename verify** — third `ZipFile` open on the final path. Catches "the rename completed but the destination is unreadable" (rare, but possible on flaky SMB where the rename ACKs but the result is partial).
+9. **Success** → `.bak` deleted. **Any-step failure after the backup move** → tmp deleted, `.bak` moved back over target (atomic rollback), `.bak` deleted, original IOException rethrown. **Failures before the backup move** simply delete the tmp; `target` was never touched. **Rollback failure** → `.bak` is left on disk and a fatal-level log line gives its path so the user can restore manually.
+
+The lambda signature is `(OutputStream) -> Unit` so callers can wrap the stream in either `java.util.zip.ZipOutputStream` (ComicInfoGenerator, DownloadExecutor) or Apache `commons-compress` `ZipArchiveOutputStream` (PageSplitter, BookPageEditor — which use `setMethod(DEFLATED) + setLevel(NO_COMPRESSION)`). Same writer covers both APIs.
+
+#### Modified / new files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/util/CbzSafeWriter.kt` (new) | `object` with `safelyReplace(target: Path, write: (OutputStream) -> Unit)`. Backup via `Files.move(ATOMIC_MOVE)` (REPLACE_EXISTING fallback). RAM/disk threshold at 100 MB (`RAM_BUILD_THRESHOLD`). Disk-space check requires 2× expected-size (`MIN_FREE_RATIO`). Three verify points (in-RAM, post-write, post-rename). Atomic rename with REPLACE_EXISTING fallback. Try/catch wraps the entire critical section; rollback restores from `.bak` on any failure; only deletes `.bak` after a confirmed-clean swap. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/PageSplitter.kt` | The post-`pagesToSplit.isEmpty()` write block (previously `ZipArchiveOutputStream(tempPath.outputStream())` + `Files.move`) is replaced by `CbzSafeWriter.safelyReplace(book.path) { outStream -> ZipArchiveOutputStream(outStream).use { ... } }`. The dead `tempPath.deleteIfExists()` from the catch arm is removed (CbzSafeWriter handles tmp cleanup internally). The legacy `backupPath` (the older PageSplitter backup mechanism) is kept because the wider try/catch in the function still restores from it for non-CbzSafeWriter failures (e.g. an exception during `bookAnalyzer.analyze` after the write succeeded). |
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/BookPageEditor.kt` | Both `removeHashedPages` and `deletePages` replace their `ZipArchiveOutputStream(tempFile.outputStream())` + `tempFile.moveTo` blocks with `CbzSafeWriter.safelyReplace(book.path) { ... }`. The subsequent re-scan/analyze calls now run against `book.path` directly instead of `tempFile`. The `ZipException` catch (which sets ERROR status) wraps the safelyReplace call so a build-time corruption is caught and flagged. |
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/download/ComicInfoGenerator.kt` | `writeInjected` and `injectComicInfoWithRetry` swap their tmp-file orchestration for `CbzSafeWriter.safelyReplace(cbzPath) { outStream -> ZipOutputStream(outStream).use { ... } }`. The retry loop in `injectComicInfoWithRetry` keeps its `useStored` flip on `ZipException` (STORED→DEFLATED) and the FileSystemException retry-with-backoff (file locked by a concurrent process); the actual write atomicity is delegated to the writer. |
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | `patchComicInfo` (called for Add-Chapter-Download custom-naming) routes through `CbzSafeWriter.safelyReplace(cbz.toPath()) { ... }` so an override-rewrite mid-write can't leave the just-downloaded chapter corrupt. The outer `try/catch (Exception)` keeps the existing "warn + carry on" behaviour: a failed override is preferable to a failed-and-rolled-back chapter when the download itself succeeded. |
+
+### Fix: `/media-management/duplicate-files` materialised every duplicate-hash key into Kotlin memory, then sent the full list back to SQLite
+
+`BookDtoDao.findAllDuplicates` ran two queries: query #1 selected all duplicate `FILE_HASH` / `FILE_SIZE` group keys into a `Map<String, Int>` (one row per distinct hash with count > 1), then query #2 fed `hashes.keys` into a SQL `IN (...)` against `b.FILE_HASH`. For a 26 k-book library with ~1 k duplicate hashes the IN-clause had ~1 k literal strings, which SQLite cannot index-resolve and falls back to a full table scan; the round-trip serialise→deserialise of the keys through JDBC also added measurable latency. The page either timed out or rendered nothing depending on which side gave up first.
+
+Refactored to one DSL `duplicateHashSubquery` (the same SELECT-with-HAVING from query #1, but as a subquery instead of a materialised collection); both the `count(*)` and the paginated DTO select use `b.FILE_HASH.in(duplicateHashSubquery)`. SQLite evaluates the subquery once per outer reference and the join uses the `FILE_HASH` index; total query time drops from minutes to seconds at 26 k books. **Why two `.in(subquery)` references instead of caching the result** — JOOQ's DSL builders for jOOQ-generated tables don't share subquery results across `fetchCount` and `selectBase`, but SQLite's optimiser handles the redundant evaluation cheaply (the inner query is a single index-scan); caching across both would have required a temp-table dance that costs more than it saves at this size.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/jooq/main/BookDtoDao.kt` | `findAllDuplicates` rewritten: removed the `hashes` Map materialisation; introduced `duplicateHashSubquery` (DSL select/from/groupBy/having); count via `fetchCount(... where FILE_HASH.in(subquery))`; DTO query reuses the same subquery in the where-clause. `count`/`PageImpl` math identical to before. |
+
+### Fix: completed downloads didn't trigger a series rescan, new chapters lingered on disk without entering Komga
+
+`processDownload` updated `DownloadStatus.COMPLETED` and broadcast the `DownloadCompleted` WebSocket event, but never asked Komga to scan the destination library. For chapters that landed in an existing series this was usually fine because Komga's `LibraryContentLifecycle` re-scans on its own schedule. But the user's expectation — and the natural behaviour for Add-Chapter-Download — is that the new file appears in the UI immediately after the download finishes; waiting for the next library-scheduled scan (which can be hours away depending on settings) confused the user enough to file it as a bug.
+
+When `result.newlyDownloaded > 0` and `download.libraryId != null`, the COMPLETED handler now also calls `taskEmitter.scanLibrary(download.libraryId, scanDeep = false)` and logs `Triggered library scan after download (N new files)`. A `scanDeep = false` scan is cheap (filesystem walk + new-file detection, no re-hash of existing books) so this is a safe always-on trigger. The `newlyDownloaded` guard prevents firing a scan after a no-op resume that found nothing new.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/domain/service/DownloadExecutor.kt` | Inside the `result.success` branch in `processDownload`, after the `eventPublisher.publishEvent(DomainEvent.DownloadCompleted(...))` call: `if (result.newlyDownloaded > 0 && download.libraryId != null) { taskEmitter.scanLibrary(download.libraryId, scanDeep = false); logger.info { ... } }`. |
+| `komga/docker/Dockerfile.tpl` | Split the monolithic `RUN` into two layers: Layer 1 (apt packages + kepubify, no ARG reference, stable across komga builds) and Layer 2 (`pip3 install gallery-dl-komga` gated by `ARG GALLERY_DL_REV`). Drops `apt-get purge curl` (curl needed in Layer 2 for the github commits API call). End-user pull per komga release drops from ~200 MB to ~10-25 MB because `GALLERY_DL_REV=${{ github.run_id }}-${{ github.run_attempt }}` no longer invalidates the ~150-180 MB apt layer. |
+
+### Feature: Library "Newest" sort uses book-creation time as tiebreaker
+
+The series-list `lastModifiedDate`/`lastModified` sort (UI label "Date updated") was a single `ORDER BY MAX(book_metadata.release_date)`. `RELEASE_DATE` carries day-granularity only and is frequently missing or backdated to the original chapter release. Effect in the user's library: when several series received a new chapter on the same day — or when a freshly downloaded chapter had an old `release_date` (backfill of an older chapter, missing metadata) — the sort order between those series collapsed to whatever SQLite's row order happened to be, so "just downloaded a new chapter" series did not surface to the top.
+
+`SeriesDtoDao` now appends `MAX(book.created_date)` as a second `ORDER BY` term whenever the sort property is `lastModifiedDate` or `lastModified`. `BOOK.CREATED_DATE` is the DB insert timestamp with millisecond precision, written once on first import and never touched by later content mutations (page-split, ComicInfo re-injection, `CbzSafeWriter` rewrites). Tiebreaker direction follows the primary sort direction (DESC primary → DESC tiebreaker).
+
+Other sort fields (`createdDate`, `name`, `booksCount`, `readDate`, `metadata.titleSort`, `random`, `relevance`, `collection.number`, `booksMetadata.releaseDate`) are untouched.
+
+#### Modified files
+| File | Change |
+|------|--------|
+| `komga/src/main/kotlin/org/gotson/komga/infrastructure/jooq/main/SeriesDtoDao.kt` | Added private `newestBookCreatedDate` field (`MAX(BOOK.CREATED_DATE)` correlated subquery on `b.SERIES_ID = s.ID`). Rewrote the `orderBy` builder from `mapNotNull` to `flatMap`: for the `lastModifiedDate`/`lastModified` properties it now emits a two-element `[primary, newestBookCreatedDate]` sort-field list with matching direction; all other properties keep a one-element list. The `sorts` map mapping for these two properties is unchanged (`newestBookReleaseDate` remains the primary). |
+
+---
+
 ## [0.1.4.5] - 2026-05-31 Hotfix
 
 ### Fix: gallery-dl resume cleanup recursively deleted entire series folders (data loss)

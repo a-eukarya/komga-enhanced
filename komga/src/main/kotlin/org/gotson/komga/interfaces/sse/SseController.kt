@@ -5,6 +5,7 @@ import org.gotson.komga.application.tasks.TasksRepository
 import org.gotson.komga.domain.model.DomainEvent
 import org.gotson.komga.domain.model.KomgaUser
 import org.gotson.komga.domain.persistence.BookRepository
+import org.gotson.komga.infrastructure.background.BackgroundJobTracker
 import org.gotson.komga.infrastructure.security.KomgaPrincipal
 import org.gotson.komga.infrastructure.web.toFilePath
 import org.gotson.komga.interfaces.sse.dto.BookImportSseDto
@@ -39,6 +40,7 @@ private val logger = KotlinLogging.logger {}
 class SseController(
   private val bookRepository: BookRepository,
   private val tasksRepository: TasksRepository,
+  private val backgroundJobTracker: BackgroundJobTracker,
 ) : SmartLifecycle {
   private var acceptingConnections = true
   private val emitters = Collections.synchronizedMap(HashMap<SseEmitter, KomgaUser>())
@@ -73,7 +75,8 @@ class SseController(
   fun taskCount() {
     if (emitters.isNotEmpty()) {
       val tasksCount = tasksRepository.countBySimpleType()
-      emitSse("TaskQueueStatus", TaskQueueSseDto(tasksCount.values.sum(), tasksCount), adminOnly = true)
+      val bg = backgroundJobTracker.snapshot().keys.sorted()
+      emitSse("TaskQueueStatus", TaskQueueSseDto(tasksCount.values.sum(), tasksCount, bg), adminOnly = true)
     }
   }
 

@@ -34,6 +34,29 @@
               />
             </v-col>
           </v-row>
+          <v-row align="center" class="mt-0">
+            <v-col cols="auto">
+              <v-btn color="warning" :disabled="verifyInProgress" :loading="verifyInProgress" @click="startVerify">
+                Verify ZIP integrity
+              </v-btn>
+            </v-col>
+            <v-col v-if="verifyInProgress || verifyTotal > 0" class="text-caption">
+              {{ verifyProcessed }} / {{ verifyTotal }} checked · {{ verifyFlagged }} flagged
+            </v-col>
+            <v-col cols="auto" v-if="!verifyInProgress && verifyFlagged > 0">
+              <v-btn color="primary" :disabled="repairInProgress" :loading="repairInProgress" @click="startRepair">
+                Repair flagged ({{ verifyFlagged }})
+              </v-btn>
+            </v-col>
+            <v-col cols="auto" v-if="!verifyInProgress && verifyFlagged > 0">
+              <v-btn color="secondary" :loading="rescanning" :disabled="rescanning" @click="rescanFlagged">
+                Rescan flagged ({{ verifyFlagged }})
+              </v-btn>
+            </v-col>
+            <v-col v-if="repairInProgress || repairTotal > 0" class="text-caption">
+              Repair: {{ repairProcessed }} / {{ repairTotal }} · fixed {{ repairFixed }} · partial {{ repairPartial }} · failed {{ repairFailed }}
+            </v-col>
+          </v-row>
         </v-container>
       </template>
 
@@ -62,6 +85,12 @@
         </v-btn>
       </template>
     </v-data-table>
+    <v-snackbar v-model="rescanSnack" :timeout="4000" bottom>
+      {{ rescanMsg }}
+      <template v-slot:action="{ attrs }">
+        <v-btn text v-bind="attrs" @click="rescanSnack = false">Close</v-btn>
+      </template>
+    </v-snackbar>
   </v-container>
 </template>
 
@@ -92,7 +121,27 @@ export default Vue.extend({
       } as any,
       filterStatus: ['error', 'unsupported'],
       filterLibraries: [] as string[],
+      verifyInProgress: false,
+      verifyProcessed: 0,
+      verifyTotal: 0,
+      verifyFlagged: 0,
+      verifyPollHandle: 0 as any,
+      repairInProgress: false,
+      repairProcessed: 0,
+      repairTotal: 0,
+      repairFixed: 0,
+      repairPartial: 0,
+      repairFailed: 0,
+      rescanning: false,
+      rescanMsg: '',
+      rescanSnack: false,
     }
+  },
+  mounted() {
+    this.refreshVerifyStatus()
+  },
+  beforeDestroy() {
+    if (this.verifyPollHandle) clearInterval(this.verifyPollHandle)
   },
   watch: {
     options: {
@@ -144,6 +193,70 @@ export default Vue.extend({
   methods: {
     getLibraryName(libraryId: string): string {
       return this.$store.getters.getLibraryById(libraryId).name
+    },
+    async refreshVerifyStatus() {
+      try {
+        const r = await this.$http.get('/api/v1/media-management/integrity/status')
+        this.verifyInProgress = r.data.inProgress
+        this.verifyProcessed = r.data.processed
+        this.verifyTotal = r.data.total
+        this.verifyFlagged = r.data.flagged
+        this.repairInProgress = r.data.repairInProgress
+        this.repairProcessed = r.data.repairProcessed
+        this.repairTotal = r.data.repairTotal
+        this.repairFixed = r.data.repairFixed
+        this.repairPartial = r.data.repairPartial
+        this.repairFailed = r.data.repairFailed
+        const stillRunning = this.verifyInProgress || this.repairInProgress
+        if (stillRunning && !this.verifyPollHandle) {
+          this.verifyPollHandle = setInterval(() => this.refreshVerifyStatus(), 3000)
+        } else if (!stillRunning && this.verifyPollHandle) {
+          clearInterval(this.verifyPollHandle)
+          this.verifyPollHandle = 0
+          this.loadBooks()
+        }
+      } catch {
+      }
+    },
+    async startVerify() {
+      try {
+        await this.$http.post('/api/v1/media-management/integrity/verify')
+        this.verifyInProgress = true
+        this.refreshVerifyStatus()
+      } catch (e: any) {
+        if (e.response?.status === 409) {
+          this.refreshVerifyStatus()
+        } else {
+          this.$eventHub.$emit('error', {message: e.message})
+        }
+      }
+    },
+    async startRepair() {
+      try {
+        await this.$http.post('/api/v1/media-management/integrity/repair')
+        this.repairInProgress = true
+        this.refreshVerifyStatus()
+      } catch (e: any) {
+        if (e.response?.status === 409) {
+          this.refreshVerifyStatus()
+        } else {
+          this.$eventHub.$emit('error', {message: e.message})
+        }
+      }
+    },
+    async rescanFlagged() {
+      this.rescanning = true
+      try {
+        const r = await this.$http.post('/api/v1/media-management/integrity/rescan')
+        this.rescanMsg = `${r.data.queued} re-queued for analyze · ${r.data.stillCorrupt} still corrupt (kept as ERROR)`
+        this.rescanSnack = true
+        setTimeout(() => this.loadBooks(), 2000)
+      } catch (e: any) {
+        this.rescanMsg = `Rescan failed: ${e.message}`
+        this.rescanSnack = true
+      } finally {
+        this.rescanning = false
+      }
     },
     async loadBooks() {
       this.loading = true

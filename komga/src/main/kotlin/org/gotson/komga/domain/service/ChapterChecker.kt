@@ -375,17 +375,15 @@ class ChapterChecker(
         return@forEach
       }
 
-      if (chapterUrls.size > cbzCount) {
-        val existingUrls = chapterMatcher.extractChapterUrlsFromCbzFiles(seriesDir)
-        val staleEntries = chapterUrls.filter { it.url !in existingUrls }
-        if (staleEntries.isNotEmpty()) {
-          staleEntries.forEach { chapterUrlRepository.delete(it.id) }
-          totalRemoved += staleEntries.size
-          val remaining = chapterUrls.size - staleEntries.size
-          details.add(DeletedChapterDetail(series.name, staleEntries.size, remaining, cbzCount))
-          logger.info {
-            "Deleted chapters scan: '${series.name}' had ${chapterUrls.size} DB entries, $cbzCount files, removed ${staleEntries.size} stale entries"
-          }
+      val existingUrls = chapterMatcher.extractChapterUrlsFromCbzFiles(seriesDir)
+      val staleEntries = chapterUrls.filter { it.url !in existingUrls }
+      if (staleEntries.isNotEmpty()) {
+        staleEntries.forEach { chapterUrlRepository.delete(it.id) }
+        totalRemoved += staleEntries.size
+        val remaining = chapterUrls.size - staleEntries.size
+        details.add(DeletedChapterDetail(series.name, staleEntries.size, remaining, cbzCount))
+        logger.info {
+          "Deleted chapters scan: '${series.name}' had ${chapterUrls.size} DB entries, $cbzCount files, removed ${staleEntries.size} stale entries"
         }
       }
     }

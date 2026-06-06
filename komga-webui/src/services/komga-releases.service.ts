@@ -32,4 +32,16 @@ export default class KomgaReleasesService {
       throw new Error(msg)
     }
   }
+
+  async getGalleryDlForkUpdates(): Promise<GalleryDlForkUpdateDto> {
+    try {
+      return (await this.http.get(`${API_RELEASES}/gallery-dl-fork`)).data
+    } catch (e) {
+      let msg = 'An error occurred while trying to retrieve gallery-dl-fork updates'
+      if (e.response?.data?.message) {
+        msg += `: ${e.response.data.message}`
+      }
+      throw new Error(msg)
+    }
+  }
 }

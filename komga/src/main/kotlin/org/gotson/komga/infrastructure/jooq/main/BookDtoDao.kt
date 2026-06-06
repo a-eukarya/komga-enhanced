@@ -274,23 +274,27 @@ class BookDtoDao(
     userId: String,
     pageable: Pageable,
   ): Page<BookDto> {
-    val hashes =
-      dslRO
-        .select(b.FILE_HASH, DSL.count(b.ID))
+    val duplicateHashSubquery =
+      DSL
+        .select(b.FILE_HASH)
         .from(b)
         .where(b.FILE_HASH.ne(""))
         .groupBy(b.FILE_HASH, b.FILE_SIZE)
         .having(DSL.count(b.ID).gt(1))
-        .fetch()
-        .associate { it.value1() to it.value2() }
 
-    val count = hashes.values.sum()
+    val count =
+      dslRO.fetchCount(
+        dslRO
+          .select(b.ID)
+          .from(b)
+          .where(b.FILE_HASH.`in`(duplicateHashSubquery)),
+      )
 
     val orderBy = pageable.sort.toOrderBy(sorts)
     val dtos =
       dslRO
         .selectBase(userId)
-        .where(b.FILE_HASH.`in`(hashes.keys))
+        .where(b.FILE_HASH.`in`(duplicateHashSubquery))
         .orderBy(orderBy)
         .apply { if (pageable.isPaged) limit(pageable.pageSize).offset(pageable.offset) }
         .fetchAndMap(dslRO)

@@ -33,7 +33,7 @@
         <v-tooltip left>
           <template v-slot:activator="{ on }">
             <v-progress-linear
-              :active="taskCount > 0"
+              :active="taskCount > 0 || backgroundJobs.length > 0"
               indeterminate
               absolute
               bottom
@@ -46,6 +46,10 @@
           <div v-for="taskType in Object.keys(taskCountByType)"
                :key="taskType"
           >{{ taskType }}: {{ taskCountByType[taskType] }}
+          </div>
+          <div v-if="backgroundJobs.length > 0" class="mt-2">
+            <div class="mb-1 font-weight-bold">Background:</div>
+            <div v-for="job in backgroundJobs" :key="job">{{ job }}</div>
           </div>
         </v-tooltip>
       </v-list-item>
@@ -296,7 +300,7 @@
               <v-badge
                 dot
                 inline
-                :value="$store.getters.isLatestVersion() == 0 || $store.getters.isForkLatestVersion() == 0"
+                :value="$store.getters.isLatestVersion() == 0 || $store.getters.isForkLatestVersion() == 0 || $store.getters.isGalleryDlForkUpToDate() == 0"
                 color="warning"
               >
                 <v-list-item-title>{{ $t('server.updates') }}</v-list-item-title>
@@ -389,7 +393,7 @@
         >
           <v-badge
             dot
-            :value="$store.getters.isLatestVersion() == 0 || $store.getters.isForkLatestVersion() == 0"
+            :value="$store.getters.isLatestVersion() == 0 || $store.getters.isForkLatestVersion() == 0 || $store.getters.isGalleryDlForkUpToDate() == 0"
             color="warning"
           >
             <router-link :to="{name: 'updates'}" class="link-none">
@@ -464,6 +468,9 @@ export default Vue.extend({
       this.$komgaReleases.getForkReleases()
         .then(x => this.$store.commit('setForkReleases', x))
         .catch(() => {})
+      this.$komgaReleases.getGalleryDlForkUpdates()
+        .then(x => this.$store.commit('setGalleryDlForkUpdates', x))
+        .catch(() => this.$store.commit('setGalleryDlForkUpdates', {installedSha: null, behindCount: -1, commits: []}))
     }
     this.checkRoute(this.$route)
   },
@@ -475,6 +482,9 @@ export default Vue.extend({
   computed: {
     taskCount(): number {
       return this.$store.state.komgaSse.taskCount
+    },
+    backgroundJobs(): string[] {
+      return this.$store.state.komgaSse.backgroundJobs || []
     },
     taskCountByType(): { [key: string]: number } {
       return this.$store.state.komgaSse.taskCountByType

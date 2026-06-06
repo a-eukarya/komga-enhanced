@@ -1,5 +1,10 @@
 <template>
   <div>
+    <add-chapter-download-dialog
+      v-model="addChapterDownloadDialog"
+      :series="addChapterDownloadSeries"
+    />
+
     <collection-add-to-dialog
       v-model="addToCollectionDialog"
       :series-ids="addToCollectionSeriesIds"
@@ -100,6 +105,7 @@
 </template>
 
 <script lang="ts">
+import AddChapterDownloadDialog from '@/components/dialogs/AddChapterDownloadDialog.vue'
 import CollectionAddToDialog from '@/components/dialogs/CollectionAddToDialog.vue'
 import CollectionEditDialog from '@/components/dialogs/CollectionEditDialog.vue'
 import EditBooksDialog from '@/components/dialogs/EditBooksDialog.vue'
@@ -120,6 +126,7 @@ import EditOneshotDialog from '@/components/dialogs/EditOneshotDialog.vue'
 export default Vue.extend({
   name: 'ReusableDialogs',
   components: {
+    AddChapterDownloadDialog,
     EditOneshotDialog,
     BulkEditBooksDialog,
     ConfirmationDialog,
@@ -132,6 +139,18 @@ export default Vue.extend({
     EditSeriesDialog,
   },
   computed: {
+    // add chapter download
+    addChapterDownloadDialog: {
+      get(): boolean {
+        return this.$store.state.addChapterDownloadDialog
+      },
+      set(val) {
+        this.$store.dispatch('dialogAddChapterDownloadDisplay', val)
+      },
+    },
+    addChapterDownloadSeries(): SeriesDto | undefined {
+      return this.$store.state.addChapterDownloadSeries
+    },
     // collections
     addToCollectionDialog: {
       get(): boolean {

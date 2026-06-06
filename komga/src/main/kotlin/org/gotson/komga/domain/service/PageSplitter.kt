@@ -20,6 +20,8 @@ import org.springframework.transaction.support.TransactionTemplate
 import java.io.FileNotFoundException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import java.util.zip.Deflater
 import java.util.zip.ZipFile
 import kotlin.io.path.deleteIfExists
@@ -50,6 +52,11 @@ class PageSplitter(
     const val MIN_VALID_DIMENSION = 50
     const val MAX_WIDE_RATIO = 10.0
     const val MIN_TARGET_DIMENSION = 300
+
+    private const val MAX_PARALLEL_SPLITS = 2
+
+    private val bookLocks = ConcurrentHashMap<String, Any>()
+    private val globalSplitSemaphore = Semaphore(MAX_PARALLEL_SPLITS)
   }
 
   /**
@@ -65,6 +72,24 @@ class PageSplitter(
     maxRatio: Double? = null,
     mode: SplitMode = SplitMode.TALL,
     pageNumbers: Set<Int>? = null,
+  ): SplitResult {
+    val lock = bookLocks.computeIfAbsent(book.id) { Any() }
+    globalSplitSemaphore.acquire()
+    try {
+      synchronized(lock) {
+        return runSplit(book, maxHeight, maxRatio, mode, pageNumbers)
+      }
+    } finally {
+      globalSplitSemaphore.release()
+    }
+  }
+
+  private fun runSplit(
+    book: Book,
+    maxHeight: Int?,
+    maxRatio: Double?,
+    mode: SplitMode,
+    pageNumbers: Set<Int>?,
   ): SplitResult {
     if (book.path.exists().not()) {
       throw FileNotFoundException("File not found: ${book.path}")
@@ -156,9 +181,7 @@ class PageSplitter(
 
     logger.info { "Found ${pagesToSplit.size} pages to split in book: ${book.name}" }
 
-    // Create backup and process
     val backupPath = book.path.parent.resolve("${book.path.nameWithoutExtension}_backup.${book.path.extension}")
-    val tempPath = book.path.parent.resolve("${book.path.nameWithoutExtension}_split.${book.path.extension}")
 
     val originalComment =
       try {
@@ -168,76 +191,62 @@ class PageSplitter(
       }
 
     try {
-      // Create backup
       Files.copy(book.path, backupPath, StandardCopyOption.REPLACE_EXISTING)
       logger.debug { "Created backup at: $backupPath" }
 
       var newPagesCreated = 0
 
-      // Create new archive with split pages
-      ZipArchiveOutputStream(tempPath.outputStream()).use { zipStream ->
-        zipStream.setMethod(ZipArchiveOutputStream.DEFLATED)
-        zipStream.setLevel(Deflater.NO_COMPRESSION)
-        if (!originalComment.isNullOrBlank()) zipStream.setComment(originalComment)
+      org.gotson.komga.infrastructure.util.CbzSafeWriter.safelyReplace(book.path) { outStream ->
+        ZipArchiveOutputStream(outStream).use { zipStream ->
+          zipStream.setMethod(ZipArchiveOutputStream.DEFLATED)
+          zipStream.setLevel(Deflater.NO_COMPRESSION)
+          if (!originalComment.isNullOrBlank()) zipStream.setComment(originalComment)
 
-        var newPageNumber = 1
-
-        media.pages.forEachIndexed { index, page ->
-          val pageToSplit = pagesToSplit.find { it.pageIndex == index }
-
-          if (pageToSplit != null) {
-            val splitImages =
-              try {
-                val imageBytes = bookAnalyzer.getFileContent(BookWithMedia(book, media), page.fileName)
-                if (pageToSplit.mode == SplitMode.WIDE) {
-                  imageSplitter.splitWideImage(imageBytes, pageToSplit.effectiveMax, getFormatFromMediaType(page.mediaType))
-                } else {
-                  imageSplitter.splitTallImage(imageBytes, pageToSplit.effectiveMax, getFormatFromMediaType(page.mediaType))
+          media.pages.forEachIndexed { index, page ->
+            val pageToSplit = pagesToSplit.find { it.pageIndex == index }
+            if (pageToSplit != null) {
+              val splitImages =
+                try {
+                  val imageBytes = bookAnalyzer.getFileContent(BookWithMedia(book, media), page.fileName)
+                  if (pageToSplit.mode == SplitMode.WIDE) {
+                    imageSplitter.splitWideImage(imageBytes, pageToSplit.effectiveMax, getFormatFromMediaType(page.mediaType))
+                  } else {
+                    imageSplitter.splitTallImage(imageBytes, pageToSplit.effectiveMax, getFormatFromMediaType(page.mediaType))
+                  }
+                } catch (e: Exception) {
+                  logger.warn(e) { "Failed to split page ${index + 1} (${page.fileName}, ${pageToSplit.width}x${pageToSplit.height}) in book: ${book.name}" }
+                  throw e
                 }
-              } catch (e: Exception) {
-                logger.warn(e) { "Failed to split page ${index + 1} (${page.fileName}, ${pageToSplit.width}x${pageToSplit.height}) in book: ${book.name}" }
-                throw e
+              splitImages.forEachIndexed { partIndex, partBytes ->
+                val extension = getExtensionFromMediaType(page.mediaType)
+                val newFileName = generateSplitPageName(page.fileName, partIndex + 1, splitImages.size, extension)
+                zipStream.putArchiveEntry(ZipArchiveEntry(newFileName))
+                zipStream.write(partBytes)
+                zipStream.closeArchiveEntry()
+                if (partIndex > 0) newPagesCreated++
               }
-
-            splitImages.forEachIndexed { partIndex, partBytes ->
-              val extension = getExtensionFromMediaType(page.mediaType)
-              val newFileName = generateSplitPageName(page.fileName, partIndex + 1, splitImages.size, extension)
-
-              zipStream.putArchiveEntry(ZipArchiveEntry(newFileName))
-              zipStream.write(partBytes)
+              logger.debug { "Split page ${index + 1} into ${splitImages.size} parts" }
+            } else {
+              val content = bookAnalyzer.getFileContent(BookWithMedia(book, media), page.fileName)
+              zipStream.putArchiveEntry(ZipArchiveEntry(page.fileName))
+              zipStream.write(content)
               zipStream.closeArchiveEntry()
-
-              newPageNumber++
-              if (partIndex > 0) newPagesCreated++
             }
-
-            logger.debug { "Split page ${index + 1} into ${splitImages.size} parts" }
-          } else {
-            // Copy page as-is
-            val content = bookAnalyzer.getFileContent(BookWithMedia(book, media), page.fileName)
-            zipStream.putArchiveEntry(ZipArchiveEntry(page.fileName))
-            zipStream.write(content)
-            zipStream.closeArchiveEntry()
-            newPageNumber++
           }
-        }
 
-        media.files.forEach { file ->
-          try {
-            val content = bookAnalyzer.getFileContent(BookWithMedia(book, media), file.fileName)
-            zipStream.putArchiveEntry(ZipArchiveEntry(file.fileName))
-            zipStream.write(content)
-            zipStream.closeArchiveEntry()
-          } catch (_: org.gotson.komga.domain.model.EntryNotFoundException) {
-            logger.warn { "Skipping missing file ${file.fileName} in book: ${book.name}" }
+          media.files.forEach { file ->
+            try {
+              val content = bookAnalyzer.getFileContent(BookWithMedia(book, media), file.fileName)
+              zipStream.putArchiveEntry(ZipArchiveEntry(file.fileName))
+              zipStream.write(content)
+              zipStream.closeArchiveEntry()
+            } catch (_: org.gotson.komga.domain.model.EntryNotFoundException) {
+              logger.warn { "Skipping missing file ${file.fileName} in book: ${book.name}" }
+            }
           }
         }
       }
-
-      // Replace original with new file
-      book.path.deleteIfExists()
-      Files.move(tempPath, book.path, StandardCopyOption.REPLACE_EXISTING)
-      logger.debug { "Replaced original file with split version" }
+      logger.debug { "Replaced original file with split version (via CbzSafeWriter)" }
 
       // Re-analyze the book
       val updatedBook =
@@ -274,7 +283,6 @@ class PageSplitter(
     } catch (e: Exception) {
       logger.error(e) { "Failed to split pages in book: ${book.name}" }
 
-      // Restore backup if it exists
       if (backupPath.exists()) {
         try {
           Files.move(backupPath, book.path, StandardCopyOption.REPLACE_EXISTING)
@@ -283,9 +291,6 @@ class PageSplitter(
           logger.error(restoreError) { "Failed to restore backup!" }
         }
       }
-
-      // Clean up temp file
-      tempPath.deleteIfExists()
 
       return SplitResult(
         bookId = book.id,

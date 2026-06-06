@@ -66,7 +66,7 @@
         <v-btn
           color="warning"
           @click="splitSelected"
-          :disabled="selectedPages.length === 0"
+          :disabled="selectedPages.length === 0 || splitting"
           :loading="splitting"
           class="mr-2 mb-2"
         >
@@ -77,7 +77,7 @@
         <v-btn
           color="error"
           @click="confirmSplitAll"
-          :disabled="oversizedPages.length === 0"
+          :disabled="oversizedPages.length === 0 || splitting"
           :loading="splitting"
           class="mb-2"
         >
@@ -328,8 +328,8 @@
         </v-card-text>
         <v-card-actions>
           <v-spacer></v-spacer>
-          <v-btn text @click="showConfirmDialog = false">Cancel</v-btn>
-          <v-btn color="warning" @click="splitAll">Split All</v-btn>
+          <v-btn text :disabled="splitting" @click="showConfirmDialog = false">Cancel</v-btn>
+          <v-btn color="warning" :disabled="splitting" :loading="splitting" @click="splitAll">Split All</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -476,7 +476,7 @@ export default Vue.extend({
       sortKey: 'ratio',
       sortDesc: true,
       loading: true,
-      splitting: false,
+      splitting: true,
       selectedPreset: 'webtoon',
       currentMode: 'tall' as SplitMode,
       detectRatio: 3,
@@ -514,6 +514,7 @@ export default Vue.extend({
   },
   mounted() {
     this.loadPages()
+    this.checkSplitAllStatusOnMount()
   },
   methods: {
     applyPreset(key: string) {
@@ -669,10 +670,21 @@ export default Vue.extend({
       try {
         const response = await this.$http.post(
           '/api/v1/media-management/oversized-pages/split-all',
-          {maxRatio: this.splitRatio, mode: this.currentMode},
+          {
+            maxRatio: this.splitRatio,
+            mode: this.currentMode,
+            search: this.searchQuery?.trim() || null,
+            includeIgnored: this.includeIgnored,
+            minRatio: this.detectRatio,
+          },
         )
         this.splitResults = response.data
       } catch (e: any) {
+        if (e.response?.status === 409) {
+          this.$eventHub.$emit('error', {message: 'Split-All läuft bereits — bitte warten.'})
+          this.pollSplitAllStatus()
+          return
+        }
         this.$eventHub.$emit('error', {message: e.message})
       }
 
@@ -680,6 +692,31 @@ export default Vue.extend({
       if (this.splitResults.length > 0) {
         this.showResultsDialog = true
       }
+      await this.loadPages()
+    },
+    async checkSplitAllStatusOnMount() {
+      try {
+        const r = await this.$http.get('/api/v1/media-management/oversized-pages/split-all/status')
+        if (r.data.inProgress) {
+          this.pollSplitAllStatus()
+        } else {
+          this.splitting = false
+        }
+      } catch {
+        this.splitting = false
+      }
+    },
+    async pollSplitAllStatus() {
+      while (true) {
+        try {
+          const r = await this.$http.get('/api/v1/media-management/oversized-pages/split-all/status')
+          if (!r.data.inProgress) break
+        } catch {
+          break
+        }
+        await new Promise(res => setTimeout(res, 3000))
+      }
+      this.splitting = false
       await this.loadPages()
     },
     thumbnailUrl(item: OversizedPageDto): string {

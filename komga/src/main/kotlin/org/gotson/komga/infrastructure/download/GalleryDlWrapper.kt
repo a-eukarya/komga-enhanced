@@ -298,13 +298,21 @@ class GalleryDlWrapper(
     destinationPath: Path,
     libraryPath: Path? = null,
     komgaSeriesId: String? = null,
+    chapterRange: String? = null,
     isCancelled: () -> Boolean = { false },
     onProcessStarted: (Process) -> Unit = {},
     onProgress: (DownloadProgress) -> Unit = {},
   ): DownloadResult {
+    val chapterFilterExpr = chapterRange?.let { parseChapterRangeToFilter(it) }
     val output = StringBuilder()
     val errorOutput = StringBuilder()
     var configFileForCleanup: File? = null
+    val existingCbzCountAtStart =
+      destinationPath
+        .toFile()
+        .listFiles()
+        ?.count { it.isFile && it.extension.lowercase() == "cbz" }
+        ?: 0
 
     try {
       val mangaDexId = extractMangaDexId(url)
@@ -350,6 +358,10 @@ class GalleryDlWrapper(
           if (mangaDexId == null) {
             add("--download-archive")
             add(destinationPath.resolve(".gallery-dl-archive.txt").toString())
+          }
+          if (chapterFilterExpr != null) {
+            add("--chapter-filter")
+            add(chapterFilterExpr)
           }
         }
 
@@ -446,14 +458,25 @@ class GalleryDlWrapper(
                   chapterTitle = old.chapterTitle,
                 ),
               )
-              logger.debug { "Auto-blacklisted same-group duplicate: ch.${old.chapterNumber} [${old.scanlationGroup}] ${old.chapterUrl}" }
+              logger.warn { "Auto-blacklisted same-group duplicate: ch.${old.chapterNumber} [${old.scanlationGroup}] ${old.chapterUrl}" }
             } catch (e: Exception) {
               logger.debug(e) { "Blacklist insert failed (likely duplicate): ${old.chapterUrl}" }
             }
           }
         }
       }
-      val filteredChapters = chapters.filter { it.chapterUrl !in sameGroupDuplicateUrls }
+      val filteredChapters =
+        chapters
+          .filter { it.chapterUrl !in sameGroupDuplicateUrls }
+          .let { list ->
+            if (chapterRange != null) {
+              list.filter { ch ->
+                ch.chapterNumber?.toDoubleOrNull()?.let { chapterMatchesRange(it, chapterRange) } == true
+              }
+            } else {
+              list
+            }
+          }
 
       val skippedByUrl = allChapters.count { it.chapterUrl in knownUrls }
       val skippedByBlacklist = allChapters.count { it.chapterUrl in blacklistedUrls }
@@ -496,6 +519,7 @@ class GalleryDlWrapper(
           totalChapters = downloadedFiles.size,
           errorMessage = null,
           mangaTitle = mangaInfo.title,
+          newlyDownloaded = (downloadedFiles.size - existingCbzCountAtStart).coerceAtLeast(0),
         )
       } else if (allChapters.isEmpty()) {
         val galleryDlChapterMap =
@@ -507,52 +531,11 @@ class GalleryDlWrapper(
 
         if (galleryDlChapterMap.isNotEmpty()) totalChapters = galleryDlChapterMap.size
 
-        // The series isn't scanned yet, so resume from the CBZ files alone. A chapter is done
-        // only if its CBZ carries a <Number> in the source-written ComicInfo.xml (added once
-        // the chapter fully finishes); this keys resume off the metadata, not any filename
-        // convention. Then feed gallery-dl only the missing chapter URLs via -i — which fixes
-        // gaps anywhere in the run, not just an interrupted tail.
-        val cbzFiles =
-          destDir
-            .walkTopDown()
-            .filter { it.isFile && it.extension.lowercase() == "cbz" }
-            .toList()
-        val numberByCbz = cbzFiles.associateWith { comicInfoGenerator.readChapterNumber(it)?.toDoubleOrNull() }
-        val completeNumbers = numberByCbz.values.filterNotNull().toSet()
-        // Re-download the highest complete chapter too ("-1"): it finished right before the
-        // interruption point, so re-fetch it to be safe.
-        val maxComplete = completeNumbers.maxOrNull()
-        val keptComplete = if (maxComplete != null) completeNumbers - maxComplete else completeNumbers
-        cbzFiles
-          .filter { numberByCbz[it] == null || numberByCbz[it] == maxComplete }
-          .forEach { deleteQuietly(it) }
+        filesDownloaded.set(existingCbzCountAtStart)
 
-        if (keptComplete.isNotEmpty()) filesDownloaded.set(keptComplete.size)
+        val effectiveCommand = command
 
-        var resumeInputFile: File? = null
-        val effectiveCommand =
-          if (galleryDlChapterMap.isEmpty()) {
-            command
-          } else {
-            val needed = galleryDlChapterMap.values.filter { it.chapterNumber?.toDoubleOrNull() !in keptComplete }
-            val inputFile = File.createTempFile("gallery-dl-resume-", ".txt")
-            inputFile.writeText(needed.joinToString("\n") { it.chapterUrl })
-            resumeInputFile = inputFile
-            logger.debug { "Resume: ${needed.size} chapters to download (${completeNumbers.size} already complete)" }
-            galleryDlProcess
-              .getCommand(gdlPath)
-              .toMutableList()
-              .apply {
-                add("-i")
-                add(inputFile.absolutePath)
-                add("-d")
-                add(destinationPath.toString())
-                add("--config")
-                add(configFile.absolutePath)
-              }
-          }
-
-        logger.debug { "Starting bulk download: $url (${galleryDlChapterMap.size} chapters total, ${completeNumbers.size} complete on disk)" }
+        logger.debug { "Starting bulk download: $url ($totalChapters chapters in source listing, $existingCbzCountAtStart CBZ already in destDir)" }
         logToDatabase(org.gotson.komga.domain.model.LogLevel.INFO, "Starting download: $url")
 
         val process =
@@ -627,7 +610,6 @@ class GalleryDlWrapper(
           stderrThread.join(5000)
           if (stderrThread.isAlive) stderrThread.interrupt()
           deleteQuietly(configFile)
-          resumeInputFile?.let { deleteQuietly(it) }
           throw GalleryDlException("Timeout downloading $url")
         }
         stdoutThread.join(5000)
@@ -637,7 +619,6 @@ class GalleryDlWrapper(
 
         val exitCode = process.exitValue()
         deleteQuietly(configFile)
-        resumeInputFile?.let { deleteQuietly(it) }
 
         if (exitCode != 0) {
           throw GalleryDlException("Download failed with exit code $exitCode: ${errorOutput.toString().trim()}")
@@ -712,7 +693,7 @@ class GalleryDlWrapper(
                     chapterTitle = chapter.chapterTitle,
                   ),
                 )
-                logger.debug { "Auto-blacklisted external redirect chapter $chapterNum (pages=0): ${chapter.chapterUrl}" }
+                logger.warn { "Auto-blacklisted external redirect chapter $chapterNum (pages=0): ${chapter.chapterUrl}" }
               } catch (e: Exception) {
                 logger.debug(e) { "Blacklist insert failed (likely duplicate): ${chapter.chapterUrl}" }
               }
@@ -738,7 +719,7 @@ class GalleryDlWrapper(
                     chapterTitle = chapter.chapterTitle,
                   ),
                 )
-                logger.debug { "Auto-blacklisted chapter $chapterNum after $failCount failed attempts: ${chapter.chapterUrl}" }
+                logger.warn { "Auto-blacklisted chapter $chapterNum after $failCount failed attempts: ${chapter.chapterUrl}" }
               } catch (e: Exception) {
                 logger.debug(e) { "Blacklist insert failed (likely duplicate): ${chapter.chapterUrl}" }
               }
@@ -830,7 +811,9 @@ class GalleryDlWrapper(
                   ?: cbzFiles.find { chapterMatcher.matchesChapterNumber(it.nameWithoutExtension.lowercase(), paddedChapter, chapterStr) }
 
               if (targetCbz == null) {
-                logger.warn { "Could not find CBZ file for chapter $chapterNum (expected c$paddedChapter or c$chapterStr)" }
+                val expected =
+                  if (paddedChapter == chapterStr) "c$paddedChapter" else "c$paddedChapter or c$chapterStr"
+                logger.warn { "Could not find CBZ file for chapter $chapterNum (expected $expected)" }
               } else {
                 try {
                   val chapterInfo =
@@ -923,20 +906,37 @@ class GalleryDlWrapper(
         totalChapters = downloadedFiles.size,
         errorMessage = null,
         mangaTitle = mangaInfo.title,
+        newlyDownloaded = (downloadedFiles.size - existingCbzCountAtStart).coerceAtLeast(0),
       )
     } catch (e: GalleryDlException) {
       configFileForCleanup?.let { deleteQuietly(it) }
-      logger.error(e) { "Download failed: $url" }
-      logToDatabase(org.gotson.komga.domain.model.LogLevel.ERROR, "Download failed for $url: ${e.message}", e.stackTraceToString())
+      if (isCancelled()) {
+        logger.info { "Download cancelled: $url" }
+        logToDatabase(org.gotson.komga.domain.model.LogLevel.INFO, "Download cancelled: $url")
+      } else {
+        logger.error(e) { "Download failed: $url" }
+        logToDatabase(org.gotson.komga.domain.model.LogLevel.ERROR, "Download failed for $url: ${e.message}", e.stackTraceToString())
+      }
       return DownloadResult(
         success = false,
         filesDownloaded = 0,
         downloadedFiles = emptyList(),
         totalChapters = 0,
-        errorMessage = e.message ?: "Unknown error",
+        errorMessage = if (isCancelled()) "Cancelled" else (e.message ?: "Unknown error"),
       )
     } catch (e: Exception) {
       configFileForCleanup?.let { deleteQuietly(it) }
+      if (isCancelled()) {
+        logger.info { "Download cancelled: $url" }
+        logToDatabase(org.gotson.komga.domain.model.LogLevel.INFO, "Download cancelled: $url")
+        return DownloadResult(
+          success = false,
+          filesDownloaded = 0,
+          downloadedFiles = emptyList(),
+          totalChapters = 0,
+          errorMessage = "Cancelled",
+        )
+      }
       logger.error(e) { "Unexpected error downloading: $url" }
       logToDatabase(org.gotson.komga.domain.model.LogLevel.ERROR, "Unexpected error downloading from $url: ${e.message}", e.stackTraceToString())
       return DownloadResult(
@@ -1060,6 +1060,19 @@ class GalleryDlWrapper(
 
       for (cbzFile in cbzFiles) {
         try {
+          // Refuse to overwrite CBZs that came from a non-MangaDex source — the UUID
+          // folder may contain manually-copied chapters (mangabuddy, cubari, ...) whose
+          // original ComicInfo carries source-specific <Series>/<Number>/<Web>. Re-injecting
+          // MangaDex metadata destroys that. The check runs even under forceReinject.
+          val existingWeb = comicInfoGenerator.readWebUrl(cbzFile)
+          if (existingWeb != null && !existingWeb.contains("mangadex.org", ignoreCase = true)) {
+            logger.warn {
+              "repair-comicinfo: skip ${cbzFile.name} — existing ComicInfo Web is non-MangaDex ($existingWeb)"
+            }
+            skipped++
+            continue
+          }
+
           if (!forceReinject) {
             val hasComment =
               java.util.zip.ZipFile(cbzFile).use { zf ->
@@ -1197,15 +1210,11 @@ class GalleryDlWrapper(
         )
 
       val seriesJsonFile = destinationPath.resolve("series.json").toFile()
-      val newContent = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(metadata)
-
       if (seriesJsonFile.exists()) {
-        val existingContent = seriesJsonFile.readText()
-        if (existingContent == newContent) {
-          logger.debug { "series.json unchanged, skipping rewrite" }
-          return
-        }
+        logger.debug { "series.json already exists, leaving it untouched (preserves Komga AutoMatch enrichment)" }
+        return
       }
+      val newContent = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(metadata)
 
       logger.debug { "Writing series.json to: ${seriesJsonFile.absolutePath}" }
       val tempFile = File(seriesJsonFile.parent, ".series.json.tmp")
@@ -1485,6 +1494,43 @@ class GalleryDlWrapper(
       logger.warn(e) { "Failed to save chapter failures" }
     }
   }
+
+  private fun parseChapterRangeToFilter(range: String): String? {
+    val parts = range.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    if (parts.isEmpty()) return null
+    val exprs =
+      parts.mapNotNull { part ->
+        if (part.count { it == '-' } == 1 && !part.startsWith("-") && !part.endsWith("-")) {
+          val (a, b) = part.split("-").map { it.trim() }
+          val af = a.toDoubleOrNull() ?: return@mapNotNull null
+          val bf = b.toDoubleOrNull() ?: return@mapNotNull null
+          "(chapter >= $af and chapter <= $bf)"
+        } else {
+          val n = part.toDoubleOrNull() ?: return@mapNotNull null
+          "chapter == $n"
+        }
+      }
+    return if (exprs.isEmpty()) null else exprs.joinToString(" or ")
+  }
+
+  private fun chapterMatchesRange(
+    chapterNumber: Double,
+    range: String,
+  ): Boolean {
+    val parts = range.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    for (part in parts) {
+      if (part.count { it == '-' } == 1 && !part.startsWith("-") && !part.endsWith("-")) {
+        val (a, b) = part.split("-").map { it.trim() }
+        val af = a.toDoubleOrNull() ?: continue
+        val bf = b.toDoubleOrNull() ?: continue
+        if (chapterNumber in af..bf) return true
+      } else {
+        val n = part.toDoubleOrNull() ?: continue
+        if (chapterNumber == n) return true
+      }
+    }
+    return false
+  }
 }
 
 data class ChapterDownloadInfo(
@@ -1557,6 +1603,7 @@ data class DownloadResult(
   val totalChapters: Int,
   val errorMessage: String?,
   val mangaTitle: String? = null,
+  val newlyDownloaded: Int = filesDownloaded,
 )
 
 class GalleryDlException(

@@ -20,12 +20,16 @@ import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.time.LocalDateTime
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 private val logger = KotlinLogging.logger {}
 
@@ -40,6 +44,8 @@ class DownloadExecutor(
   private val libraryRepository: LibraryRepository,
   private val seriesRepository: org.gotson.komga.domain.persistence.SeriesRepository,
   private val seriesMetadataRepository: org.gotson.komga.domain.persistence.SeriesMetadataRepository,
+  private val bookRepository: org.gotson.komga.domain.persistence.BookRepository,
+  private val bookMetadataRepository: org.gotson.komga.domain.persistence.BookMetadataRepository,
   private val pluginConfigRepository: PluginConfigRepository,
   private val galleryDlWrapper: GalleryDlWrapper,
   private val libraryLifecycle: LibraryLifecycle,
@@ -64,7 +70,7 @@ class DownloadExecutor(
     val stale = downloadQueueRepository.findByStatus(DownloadStatus.DOWNLOADING)
     if (stale.isEmpty()) return
 
-    logger.info { "Recovering ${stale.size} stale DOWNLOADING entries from previous run" }
+    logger.warn { "Recovering ${stale.size} stale DOWNLOADING entries from previous run" }
     stale.forEach { download ->
       downloadQueueRepository.update(
         download.copy(
@@ -73,7 +79,7 @@ class DownloadExecutor(
           lastModifiedDate = LocalDateTime.now(),
         ),
       )
-      logger.info { "Reset to PENDING: ${download.id} - ${download.title} (was at chapter ${download.currentChapter ?: 0}/${download.totalChapters ?: "?"})" }
+      logger.warn { "Reset to PENDING: ${download.id} - ${download.title} (was at chapter ${download.currentChapter ?: 0}/${download.totalChapters ?: "?"})" }
     }
   }
 
@@ -158,12 +164,12 @@ class DownloadExecutor(
         return
       }
 
-      logger.info { "Auto-retrying ${toRetry.size} failed downloads" }
+      logger.warn { "Auto-retrying ${toRetry.size} failed downloads" }
 
       toRetry.forEach { download ->
         try {
           retryDownload(download.id)
-          logger.info { "Auto-retry queued: ${download.id} - ${download.title} (attempt ${download.retryCount + 1})" }
+          logger.warn { "Auto-retry queued: ${download.id} - ${download.title} (attempt ${download.retryCount + 1})" }
 
           downloadProgressHandler.broadcastProgress(
             DownloadProgressDto(
@@ -195,6 +201,7 @@ class DownloadExecutor(
     title: String?,
     createdBy: String,
     priority: Int = 5,
+    overrides: ChapterDownloadOverrides? = null,
   ): DownloadQueue {
     if (libraryId != null) {
       libraryRepository.findByIdOrNull(libraryId)
@@ -229,7 +236,7 @@ class DownloadExecutor(
         destinationPath = null,
         errorMessage = null,
         pluginId = "gallery-dl-downloader",
-        metadataJson = null,
+        metadataJson = overrides?.let { serializeOverrides(it) },
         createdBy = createdBy,
         startedDate = null,
         completedDate = null,
@@ -424,6 +431,29 @@ class DownloadExecutor(
       activeDownloads[download.id] = ActiveDownload(download)
     }
 
+    val overrides = deserializeOverrides(download.metadataJson)
+
+    if (overrides?.skipIfChapterExists == true && overrides.seriesId != null) {
+      val targetNumber = overrides.customChapterNumber?.toDoubleOrNull()
+      if (targetNumber != null) {
+        val existing =
+          bookRepository
+            .findAllBySeriesId(overrides.seriesId)
+            .mapNotNull { bookMetadataRepository.findByIdOrNull(it.id)?.numberSort }
+            .toSet()
+        if (existing.contains(targetNumber.toFloat())) {
+          updateDownloadStatus(
+            download.copy(totalChapters = 0, currentChapter = 0),
+            DownloadStatus.COMPLETED,
+            completedDate = LocalDateTime.now(),
+            progressPercent = 100,
+            errorMessage = "Chapter $targetNumber already exists in series",
+          )
+          return
+        }
+      }
+    }
+
     try {
       updateDownloadStatus(download, DownloadStatus.DOWNLOADING, startedDate = LocalDateTime.now())
 
@@ -467,11 +497,16 @@ class DownloadExecutor(
         }
 
       val mangaDexId = GalleryDlWrapper.extractMangaDexId(download.sourceUrl)
+      val overridesSeries = overrides?.seriesId?.let { seriesRepository.findByIdOrNull(it) }
 
       val destinationPath: java.nio.file.Path
       val komgaSeriesId: String?
 
-      if (mangaDexId != null) {
+      if (overridesSeries != null) {
+        destinationPath = Paths.get(overridesSeries.url.toURI())
+        komgaSeriesId = overridesSeries.id
+        logger.info { "Add-Chapter-Download targets existing series ${overridesSeries.name} ($destinationPath)" }
+      } else if (mangaDexId != null) {
         val existingFolder =
           if (download.libraryId != null) {
             findExistingMangaFolder(download.libraryId, libraryPath, mangaDexId)
@@ -510,6 +545,7 @@ class DownloadExecutor(
           destinationPath = destinationPath,
           libraryPath = library?.path,
           komgaSeriesId = komgaSeriesId,
+          chapterRange = overrides?.chapterRange?.takeIf { it.isNotBlank() },
           isCancelled = isCancelled,
           onProcessStarted = { process -> setActiveProcess(download.id, process) },
         ) { progress ->
@@ -566,8 +602,25 @@ class DownloadExecutor(
 
         logger.info { "Download completed to: $finalPath (manga folder: ${result.mangaTitle})" }
 
+        overrides?.let { ov ->
+          try {
+            applyChapterOverrides(ov, result.downloadedFiles)
+          } catch (e: Exception) {
+            logger.warn(e) { "Failed to apply chapter overrides for ${download.id}" }
+          }
+        }
+
+        val finalTotalChapters =
+          result.newlyDownloaded.takeIf { it > 0 }
+            ?: download.totalChapters?.takeIf { it > 0 }
+        val finalCurrentChapter = result.newlyDownloaded.takeIf { it > 0 } ?: finalTotalChapters
+
         updateDownloadStatus(
-          download.copy(title = finalTitle),
+          download.copy(
+            title = finalTitle,
+            totalChapters = finalTotalChapters,
+            currentChapter = finalCurrentChapter,
+          ),
           DownloadStatus.COMPLETED,
           completedDate = LocalDateTime.now(),
           progressPercent = 100,
@@ -582,8 +635,8 @@ class DownloadExecutor(
             url = download.sourceUrl,
             status = "COMPLETED",
             currentChapter = null,
-            totalChapters = download.totalChapters,
-            completedChapters = download.totalChapters,
+            totalChapters = finalTotalChapters,
+            completedChapters = finalTotalChapters,
             filesDownloaded = result.filesDownloaded,
             percentage = 100,
             error = null,
@@ -597,6 +650,11 @@ class DownloadExecutor(
             filesDownloaded = result.filesDownloaded,
           ),
         )
+
+        if (result.newlyDownloaded > 0 && download.libraryId != null) {
+          taskEmitter.scanLibrary(download.libraryId, scanDeep = false)
+          logger.info { "Triggered library scan after download (${result.newlyDownloaded} new files)" }
+        }
 
         if (mangaDexId != null && komgaSeriesId != null && komgaSeriesId.isNotEmpty()) {
           try {
@@ -745,6 +803,119 @@ class DownloadExecutor(
     val folder: java.io.File,
     val komgaSeriesId: String?,
   )
+
+  private fun serializeOverrides(overrides: ChapterDownloadOverrides): String = objectMapper.writeValueAsString(overrides)
+
+  private fun deserializeOverrides(metadataJson: String?): ChapterDownloadOverrides? =
+    metadataJson?.let {
+      try {
+        objectMapper.readValue(it, ChapterDownloadOverrides::class.java)
+      } catch (e: Exception) {
+        logger.debug(e) { "Could not parse ChapterDownloadOverrides from metadataJson" }
+        null
+      }
+    }
+
+  private fun applyChapterOverrides(
+    overrides: ChapterDownloadOverrides,
+    downloadedFiles: List<String>,
+  ) {
+    val targetFile = downloadedFiles.firstOrNull()?.let { java.io.File(it) } ?: return
+    val renamed =
+      if (!overrides.customFilename.isNullOrBlank()) {
+        val newName = if (overrides.customFilename.endsWith(".cbz", ignoreCase = true)) overrides.customFilename else "${overrides.customFilename}.cbz"
+        val target = targetFile.parentFile.resolve(newName)
+        if (targetFile != target) {
+          java.nio.file.Files.move(
+            targetFile.toPath(),
+            target.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+          )
+        }
+        target
+      } else {
+        targetFile
+      }
+    patchComicInfo(renamed, overrides)
+  }
+
+  private fun patchComicInfo(
+    cbz: java.io.File,
+    overrides: ChapterDownloadOverrides,
+  ) {
+    val hasOverride =
+      !overrides.customChapterNumber.isNullOrBlank() ||
+        !overrides.customVolume.isNullOrBlank() ||
+        !overrides.customChapterTitle.isNullOrBlank()
+    if (!hasOverride) return
+    try {
+      ZipFile(cbz).use { zin ->
+        org.gotson.komga.infrastructure.util.CbzSafeWriter.safelyReplace(cbz.toPath()) { outStream ->
+          ZipOutputStream(outStream).use { zout ->
+            zout.setComment(zin.comment ?: "")
+            val xmlBytes =
+              zin.getEntry("ComicInfo.xml")?.let { entry ->
+                zin.getInputStream(entry).use { it.readBytes() }
+              }
+            val patched = patchComicInfoXml(xmlBytes, overrides)
+            zout.putNextEntry(ZipEntry("ComicInfo.xml"))
+            zout.write(patched)
+            zout.closeEntry()
+            for (entry in zin.entries()) {
+              if (entry.name == "ComicInfo.xml") continue
+              zout.putNextEntry(ZipEntry(entry.name))
+              zin.getInputStream(entry).use { it.copyTo(zout) }
+              zout.closeEntry()
+            }
+          }
+        }
+      }
+    } catch (e: Exception) {
+      logger.warn(e) { "Failed to patch ComicInfo.xml in ${cbz.name}" }
+    }
+  }
+
+  private fun patchComicInfoXml(
+    sourceBytes: ByteArray?,
+    overrides: ChapterDownloadOverrides,
+  ): ByteArray {
+    val source =
+      sourceBytes?.toString(Charsets.UTF_8) ?: "<?xml version=\"1.0\"?>\n<ComicInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n</ComicInfo>"
+    var patched = source
+    overrides.customChapterNumber?.takeIf { it.isNotBlank() }?.let {
+      patched = upsertTag(patched, "Number", it)
+    }
+    overrides.customVolume?.takeIf { it.isNotBlank() }?.let {
+      patched = upsertTag(patched, "Volume", it)
+    }
+    overrides.customChapterTitle?.takeIf { it.isNotBlank() }?.let {
+      patched = upsertTag(patched, "Title", it)
+    }
+    return patched.toByteArray(Charsets.UTF_8)
+  }
+
+  private fun upsertTag(
+    xml: String,
+    tag: String,
+    value: String,
+  ): String {
+    val escaped =
+      value
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    val tagRegex = Regex("<$tag>.*?</$tag>", RegexOption.DOT_MATCHES_ALL)
+    return if (tagRegex.containsMatchIn(xml)) {
+      tagRegex.replace(xml, "<$tag>$escaped</$tag>")
+    } else {
+      val end = xml.lastIndexOf("</ComicInfo>")
+      if (end < 0) {
+        xml
+      } else {
+        xml.substring(0, end) + "  <$tag>$escaped</$tag>\n" + xml.substring(end)
+      }
+    }
+  }
 
   private fun findExistingMangaFolder(
     libraryId: String,
@@ -975,3 +1146,13 @@ class DownloadExecutor(
     private val MANGADEX_UUID_REGEX = Regex("""^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$""")
   }
 }
+
+data class ChapterDownloadOverrides(
+  val seriesId: String? = null,
+  val chapterRange: String? = null,
+  val customFilename: String? = null,
+  val customChapterNumber: String? = null,
+  val customVolume: String? = null,
+  val customChapterTitle: String? = null,
+  val skipIfChapterExists: Boolean = true,
+)

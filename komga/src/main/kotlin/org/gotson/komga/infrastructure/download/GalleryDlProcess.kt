@@ -86,6 +86,7 @@ class GalleryDlProcess {
     val mangadexUsername = pluginConfig["mangadex_username"]
     val mangadexPassword = pluginConfig["mangadex_password"]
     val chapterNaming = pluginConfig["chapter_naming"]?.takeIf { it.isNotBlank() }
+    val flaresolverrUrl = pluginConfig["flaresolverr_url"]?.takeIf { it.isNotBlank() }
     val websiteConfigs = getDefaultWebsiteConfigs(defaultLanguage).toMutableMap()
 
     if (!mangadexUsername.isNullOrBlank() || !mangadexPassword.isNullOrBlank()) {
@@ -108,7 +109,10 @@ class GalleryDlProcess {
           mutableMapOf<String, Any>(
             "base-directory" to "",
             "directory" to globalDirectory,
-          ).apply { putAll(websiteConfigs) },
+          ).apply {
+            putAll(websiteConfigs)
+            if (flaresolverrUrl != null) put("flaresolverr", flaresolverrUrl)
+          },
         "postprocessors" to
           listOf(
             mapOf(
@@ -116,6 +120,7 @@ class GalleryDlProcess {
               "extension" to "cbz",
               "compression" to "store",
               "keep-files" to false,
+              "mode" to "safe",
             ),
             mapOf(
               "name" to "komga",

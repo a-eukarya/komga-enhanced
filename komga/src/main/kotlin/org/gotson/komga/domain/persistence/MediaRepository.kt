@@ -2,6 +2,7 @@ package org.gotson.komga.domain.persistence
 
 import org.gotson.komga.domain.model.Media
 import org.gotson.komga.domain.model.MediaExtension
+import org.gotson.komga.domain.model.OversizedPageCandidate
 
 interface MediaRepository {
   fun findById(bookId: String): Media
@@ -13,6 +14,8 @@ interface MediaRepository {
     mediaTypes: Collection<String>,
     pageHashing: Int,
   ): Collection<String>
+
+  fun findAllOversizedPageCandidates(minDimension: Int): Collection<OversizedPageCandidate>
 
   fun getPagesSizes(bookIds: Collection<String>): Collection<Pair<String, Int>>
 
@@ -37,4 +40,6 @@ interface MediaRepository {
   fun delete(bookIds: Collection<String>)
 
   fun count(): Long
+
+  fun countByStatus(status: Media.Status): Long
 }

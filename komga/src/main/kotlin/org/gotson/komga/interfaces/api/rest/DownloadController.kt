@@ -91,6 +91,7 @@ class DownloadController(
           title = create.title,
           createdBy = principal.user.email,
           priority = create.priority,
+          overrides = create.toOverrides(),
         ).toDto()
     } catch (e: IllegalArgumentException) {
       throw ResponseStatusException(HttpStatus.BAD_REQUEST, e.message)

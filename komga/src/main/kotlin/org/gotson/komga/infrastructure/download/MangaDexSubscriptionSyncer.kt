@@ -23,6 +23,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -343,6 +345,8 @@ class MangaDexSubscriptionSyncer(
       val mangaList = data["data"] as? List<Map<String, Any>> ?: emptyList()
       val total = (data["total"] as? Number)?.toInt() ?: 0
 
+      val language = resolveLanguage()
+
       for (manga in mangaList) {
         val mangaId = manga["id"] as? String ?: continue
 
@@ -350,6 +354,11 @@ class MangaDexSubscriptionSyncer(
 
         val mangaUrl = "https://mangadex.org/title/$mangaId"
         if (downloadExecutor.isUrlAlreadyQueued(mangaUrl)) continue
+
+        if (!hasDownloadableChapters(mangaId, language, token)) {
+          logger.debug { "Skipping $mangaId: no downloadable chapters in $language" }
+          continue
+        }
 
         try {
           downloadExecutor.createDownload(
@@ -375,24 +384,55 @@ class MangaDexSubscriptionSyncer(
     }
   }
 
+  private fun resolveLanguage(): String =
+    pluginConfigRepository
+      .findByPluginIdAndKey("gallery-dl-downloader", "default_language")
+      ?.configValue
+      ?: throw IllegalStateException("gallery-dl plugin default_language not configured")
+
+  private fun hasDownloadableChapters(
+    mangaId: String,
+    language: String,
+    token: String,
+  ): Boolean {
+    val url =
+      "$apiBase/manga/$mangaId/feed" +
+        "?translatedLanguage[]=$language" +
+        "&includeFuturePublishAt=0" +
+        "&includeEmptyPages=0" +
+        "&includeExternalUrl=0" +
+        "&limit=1"
+    return try {
+      val response = apiGet(url, token)
+      if (response.statusCode() != 200) {
+        logger.debug { "hasDownloadableChapters($mangaId) HTTP ${response.statusCode()} — treating as has chapters" }
+        return true
+      }
+      val data: Map<String, Any> = objectMapper.readValue(response.body())
+      val total = (data["total"] as? Number)?.toInt() ?: 0
+      total > 0
+    } catch (e: Exception) {
+      logger.debug(e) { "hasDownloadableChapters($mangaId) failed — treating as has chapters" }
+      true
+    }
+  }
+
   @Suppress("UNCHECKED_CAST")
   private fun checkFeed(
     config: Map<String, String?>,
     library: org.gotson.komga.domain.model.Library?,
   ) {
     val token = getValidToken(config)
-    val language =
-      pluginConfigRepository
-        .findByPluginIdAndKey("gallery-dl-downloader", "default_language")
-        ?.configValue ?: "en"
+    val language = resolveLanguage()
 
-    val lastCheck =
-      (config["last_check_time"]?.take(19))
-        ?: Instant
-          .now()
-          .minusSeconds(86400)
-          .atOffset(ZoneOffset.UTC)
-          .format(mangaDexDateFormat)
+    val baseTime =
+      config["last_check_time"]
+        ?.take(19)
+        ?.let { runCatching { LocalDateTime.parse(it, mangaDexDateFormat).toInstant(ZoneOffset.UTC) }.getOrNull() }
+        ?: Instant.now().minusSeconds(86400)
+
+    val lastCheckInstant = baseTime.minusSeconds(86400)
+    val lastCheck = lastCheckInstant.atOffset(ZoneOffset.UTC).format(mangaDexDateFormat)
 
     logger.info { "Checking subscription feed since $lastCheck" }
 
@@ -403,14 +443,18 @@ class MangaDexSubscriptionSyncer(
     var offset = 0
     val limit = 100
     val newChaptersByManga = mutableMapOf<String, MutableList<FeedChapter>>()
+    var totalScanned = 0
+    var totalSkippedByDate = 0
+    var stopPaging = false
 
-    while (true) {
+    while (!stopPaging) {
       val url =
         "$apiBase/user/follows/manga/feed" +
-          "?publishAtSince=${encode(lastCheck)}" +
-          "&translatedLanguage[]=$language" +
+          "?translatedLanguage[]=$language" +
           "&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica&contentRating[]=pornographic" +
-          "&order[publishAt]=asc" +
+          "&order[publishAt]=desc" +
+          "&includeFuturePublishAt=0" +
+          "&includeEmptyPages=0" +
           "&limit=$limit&offset=$offset"
 
       val response = apiGet(url, token)
@@ -424,11 +468,24 @@ class MangaDexSubscriptionSyncer(
       val total = (feedData["total"] as? Number)?.toInt() ?: 0
 
       logger.debug { "Feed page: ${chapters.size} chapters (offset=$offset, total=$total)" }
+      if (chapters.isEmpty()) break
 
       for (chapter in chapters) {
         val chapterId = chapter["id"] as? String ?: continue
         val attributes = chapter["attributes"] as? Map<String, Any> ?: continue
         val relationships = chapter["relationships"] as? List<Map<String, Any>> ?: continue
+        totalScanned++
+
+        val publishAtRaw = attributes["publishAt"] as? String
+        val publishAt =
+          publishAtRaw?.let {
+            runCatching { OffsetDateTime.parse(it).toInstant() }.getOrNull()
+          }
+        if (publishAt != null && publishAt.isBefore(lastCheckInstant)) {
+          totalSkippedByDate++
+          stopPaging = true
+          continue
+        }
 
         val mangaId =
           relationships
@@ -454,8 +511,10 @@ class MangaDexSubscriptionSyncer(
       }
 
       offset += chapters.size
-      if (offset >= total || chapters.isEmpty()) break
+      if (offset >= total) break
     }
+
+    logger.debug { "Feed scan complete: $totalScanned chapters inspected, $totalSkippedByDate older than $lastCheck (paging stopped)" }
 
     if (newChaptersByManga.isEmpty()) {
       logger.info { "Subscription feed: no new chapters" }

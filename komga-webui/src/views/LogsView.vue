@@ -36,7 +36,18 @@
           hide-details
           class="mt-0"
           :loading="levelLoading"
-          @change="toggleLogLevel"
+          @change="onDebugToggle"
+        />
+      </v-col>
+      <v-col cols="auto">
+        <v-switch
+          v-model="infoMode"
+          label="Info"
+          dense
+          hide-details
+          class="mt-0"
+          :loading="levelLoading"
+          @change="onInfoToggle"
         />
       </v-col>
       <v-col cols="auto">
@@ -99,6 +110,7 @@ export default Vue.extend({
     lineOptions: [100, 250, 500, 1000, 2500, 5000],
     loading: false,
     debugMode: false,
+    infoMode: false,
     levelLoading: false,
     streaming: false,
     paused: false,
@@ -146,19 +158,28 @@ export default Vue.extend({
     async fetchLogLevel() {
       try {
         const resp = await this.$http.get('/api/v1/logs/level')
-        this.debugMode = resp.data.level === 'DEBUG' || resp.data.level === 'TRACE'
+        const level = resp.data.level
+        this.debugMode = level === 'DEBUG' || level === 'TRACE'
+        this.infoMode = level === 'INFO'
       } catch {
         this.debugMode = false
+        this.infoMode = false
       }
     },
-    async toggleLogLevel(val: boolean) {
+    onDebugToggle(val: boolean) {
+      // Mutually exclusive with infoMode — debug wins.
+      if (val) this.infoMode = false
+      this.applyLogLevel()
+    },
+    onInfoToggle(val: boolean) {
+      if (val) this.debugMode = false
+      this.applyLogLevel()
+    },
+    async applyLogLevel() {
       this.levelLoading = true
+      const level = this.debugMode ? 'DEBUG' : this.infoMode ? 'INFO' : 'WARN'
       try {
-        await this.$http.post('/api/v1/logs/level', null, {
-          params: {level: val ? 'DEBUG' : 'INFO'},
-        })
-      } catch {
-        this.debugMode = !val
+        await this.$http.post('/api/v1/logs/level', null, {params: {level}})
       } finally {
         this.levelLoading = false
       }

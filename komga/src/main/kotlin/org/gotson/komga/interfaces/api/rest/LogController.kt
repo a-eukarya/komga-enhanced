@@ -3,6 +3,7 @@ package org.gotson.komga.interfaces.api.rest
 import ch.qos.logback.classic.Level
 import ch.qos.logback.classic.LoggerContext
 import org.gotson.komga.infrastructure.configuration.KomgaProperties
+import org.gotson.komga.infrastructure.configuration.KomgaSettingsProvider
 import org.slf4j.LoggerFactory
 import org.springframework.core.io.FileSystemResource
 import org.springframework.http.HttpHeaders
@@ -24,7 +25,26 @@ import java.util.concurrent.Executors
 @PreAuthorize("hasRole('ADMIN')")
 class LogController(
   private val komgaProperties: KomgaProperties,
+  private val settingsProvider: KomgaSettingsProvider,
 ) {
+  private fun applyLogLevel(level: String) {
+    val newLevel =
+      when (level.uppercase()) {
+        "DEBUG" -> Level.DEBUG
+        "TRACE" -> Level.TRACE
+        "INFO" -> Level.INFO
+        "ERROR" -> Level.ERROR
+        else -> Level.WARN
+      }
+    val loggerContext = LoggerFactory.getILoggerFactory() as LoggerContext
+    loggerContext
+      .getLogger(ch.qos.logback.classic.Logger.ROOT_LOGGER_NAME)
+      .level = newLevel
+    loggerContext
+      .getLogger("org.gotson.komga")
+      .level = newLevel
+  }
+
   private fun logFile(): Path =
     Path
       .of(komgaProperties.configDir ?: "${System.getProperty("user.home")}/.komga")
@@ -54,17 +74,13 @@ class LogController(
   fun setLogLevel(
     @RequestParam level: String,
   ): Map<String, String> {
-    val newLevel =
-      when (level.uppercase()) {
-        "DEBUG" -> Level.DEBUG
-        "TRACE" -> Level.TRACE
-        else -> Level.INFO
+    val normalized =
+      level.uppercase().let {
+        if (it !in setOf("DEBUG", "TRACE", "INFO", "WARN", "ERROR")) "WARN" else it
       }
-    val loggerContext = LoggerFactory.getILoggerFactory() as LoggerContext
-    loggerContext
-      .getLogger(ch.qos.logback.classic.Logger.ROOT_LOGGER_NAME)
-      .level = newLevel
-    return mapOf("level" to newLevel.toString())
+    applyLogLevel(normalized)
+    settingsProvider.logLevel = normalized
+    return mapOf("level" to normalized)
   }
 
   @GetMapping("/stream", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])

@@ -10,6 +10,7 @@ logging:
   file:
     name: \${komga.config-dir}/logs/komga.log
   level:
+    org.gotson.komga: WARN
     org.apache.activemq.audit: WARN
     org.apache.fontbox.cff.Type1CharString: ERROR
     org.springframework.security.config.annotation.authentication.configuration.InitializeUserDetailsBeanManagerConfigurer: ERROR
@@ -17,6 +18,10 @@ logging:
 komga:
   database:
     file: \${komga.config-dir}/database.sqlite
+    busy-timeout: 30s
+    pragmas:
+      synchronous: NORMAL
+      cache_size: 2000
   lucene:
     data-directory: \${komga.config-dir}/lucene
   fonts:
@@ -24,6 +29,9 @@ komga:
   config-dir: \${user.home}/.komga
   tasks-db:
     file: \${komga.config-dir}/tasks.sqlite
+    busy-timeout: 30s
+    pragmas:
+      synchronous: NORMAL
   download:
     enabled: true
     follow-list-filename: "follow.txt"

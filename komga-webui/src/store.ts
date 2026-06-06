@@ -17,6 +17,9 @@ const persistedState = createPersistedState({
 
 export default new Vuex.Store({
   state: {
+    // add chapter download
+    addChapterDownloadSeries: undefined as SeriesDto | undefined,
+    addChapterDownloadDialog: false,
     // collections
     addToCollectionSeriesIds: [] as string[],
     addToCollectionDialog: false,
@@ -64,6 +67,7 @@ export default new Vuex.Store({
 
     releases: [] as ReleaseDto[],
     forkReleases: [] as ReleaseDto[],
+    galleryDlForkUpdates: null as GalleryDlForkUpdateDto | null,
 
     guestMode: false,
   },
@@ -92,8 +96,22 @@ export default new Vuex.Store({
       if(currentFork == latestFork) return 1
       else return 0
     },
+    isGalleryDlForkUpToDate: (state) => (): number => {
+      const u = state.galleryDlForkUpdates
+      if(!u) return -1
+      if(u.behindCount < 0) return -1
+      if(u.behindCount === 0) return 1
+      return 0
+    },
   },
   mutations: {
+    // Add chapter download
+    setAddChapterDownloadSeries(state, series: SeriesDto | undefined) {
+      state.addChapterDownloadSeries = series
+    },
+    setAddChapterDownloadDialog(state, dialog) {
+      state.addChapterDownloadDialog = dialog
+    },
     // Collections
     setAddToCollectionSeriesIds(state, seriesIds: string[]) {
       state.addToCollectionSeriesIds = seriesIds
@@ -200,6 +218,9 @@ export default new Vuex.Store({
     setReleases(state, releases) {
       state.releases = releases
     },
+    setGalleryDlForkUpdates(state, updates: GalleryDlForkUpdateDto | null) {
+      state.galleryDlForkUpdates = updates
+    },
     setForkReleases(state, releases) {
       state.forkReleases = releases
     },
@@ -208,6 +229,14 @@ export default new Vuex.Store({
     },
   },
   actions: {
+    // add chapter download
+    dialogAddChapterDownload({commit}, series: SeriesDto) {
+      commit('setAddChapterDownloadSeries', series)
+      commit('setAddChapterDownloadDialog', true)
+    },
+    dialogAddChapterDownloadDisplay({commit}, value) {
+      commit('setAddChapterDownloadDialog', value)
+    },
     // collections
     dialogAddSeriesToCollection({commit}, seriesIds: string[]) {
       commit('setAddToCollectionSeriesIds', seriesIds)

@@ -78,7 +78,13 @@ class PluginInitializer(
                 "chapter_naming": {
                   "type": "string",
                   "title": "Chapter Naming Template (gallery-dl directory)",
-                  "description": "gallery-dl directory template for chapter folders/CBZ names. Leave blank to keep the per-site default. Common fields: {chapter}, {chapter_minor}, {volume}, {title}, {group}, {lang}. Example: 'c{chapter:>03}{chapter_minor} [{group:J, }]'. WARNING: ChapterMatcher relies on the 'c<num>' prefix — keep it for chapter detection to work.",
+                  "description": "gallery-dl directory template for chapter folders/CBZ names. Leave blank to keep the per-site default. Common fields: {chapter}, {chapter_minor}, {volume}, {title}, {group}, {lang}. Examples: 'c{chapter:>03}{chapter_minor} [{group:J, }]' or 'Chapter {chapter:>03}{chapter_minor}'. Supported prefixes for chapter detection: 'c<num>', 'ch. <num>', 'Chapter <num>'.",
+                  "default": ""
+                },
+                "flaresolverr_url": {
+                  "type": "string",
+                  "title": "FlareSolverr URL",
+                  "description": "Optional FlareSolverr endpoint (e.g. http://192.168.1.10:8191/v1) used to bypass Cloudflare challenges for sites like mgeko.cc, mangaclash.com, deatte5.com. Cookies + User-Agent are cached for 20 minutes per host. Leave blank to disable.",
                   "default": ""
                 }
               },

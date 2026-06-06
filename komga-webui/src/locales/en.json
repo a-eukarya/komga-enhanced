@@ -1129,6 +1129,7 @@
     "clear_cancelled": "Clear Cancelled",
     "clear_pending": "Clear Pending",
     "no_downloads": "No downloads in queue. Add a manga URL using the button above.",
+    "chapters": "chapters",
     "unknown_title": "Unknown",
     "downloads_folder": "Downloads folder",
     "cancel": "Cancel",

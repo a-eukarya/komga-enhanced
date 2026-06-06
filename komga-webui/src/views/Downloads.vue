@@ -88,6 +88,9 @@
                         </span>
                       </v-progress-linear>
                     </div>
+                    <div v-else-if="item.status === 'COMPLETED' && item.totalChapters" class="mt-2 caption">
+                      {{ item.currentChapter || item.totalChapters }}/{{ item.totalChapters }} {{ $t('download_manager.chapters') }}
+                    </div>
                     <div class="text-caption mt-2 d-flex flex-wrap" style="gap: 8px">
                       <span>
                         <v-icon x-small>mdi-folder</v-icon>
@@ -176,6 +179,9 @@
                   </div>
                   <div v-else-if="item.status === 'COMPLETED'">
                     <v-chip small color="success">100%</v-chip>
+                    <span v-if="item.totalChapters" class="ml-2 caption">
+                      ({{ item.currentChapter || item.totalChapters }}/{{ item.totalChapters }} {{ $t('download_manager.chapters') }})
+                    </span>
                   </div>
                   <div v-else>-</div>
                 </template>

@@ -18,6 +18,11 @@ data class SplitRequestDto(
   val maxRatio: Double? = null,
   val bookIds: List<String>? = null,
   val mode: String? = null,
+  val search: String? = null,
+  val includeIgnored: Boolean? = null,
+  val minWidth: Int? = null,
+  val minHeight: Int? = null,
+  val minRatio: Double? = null,
 )
 
 data class IgnoreOversizedPageRequestDto(

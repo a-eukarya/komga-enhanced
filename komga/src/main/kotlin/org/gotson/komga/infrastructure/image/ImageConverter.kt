@@ -8,6 +8,7 @@ import java.awt.Color
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.util.concurrent.Semaphore
 import javax.imageio.ImageIO
 import javax.imageio.spi.IIORegistry
 import javax.imageio.spi.ImageReaderSpi
@@ -23,6 +24,12 @@ class ImageConverter(
   private val imageAnalyzer: ImageAnalyzer,
   private val contentDetector: ContentDetector,
 ) {
+  companion object {
+    private const val MAX_PARALLEL_DECODES = 2
+
+    private val decodeSemaphore = Semaphore(MAX_PARALLEL_DECODES)
+  }
+
   val supportedReadFormats by lazy { ImageIO.getReaderFormatNames().toList() }
   val supportedReadMediaTypes by lazy { ImageIO.getReaderMIMETypes().toList() }
   val supportedWriteFormats by lazy { ImageIO.getWriterFormatNames().toList() }
@@ -95,11 +102,16 @@ class ImageConverter(
     format: ImageType,
     size: Int,
   ): ByteArray {
-    val builder = resizeImageBuilder(imageBytes, format, size) ?: return imageBytes
+    decodeSemaphore.acquire()
+    try {
+      val builder = resizeImageBuilder(imageBytes, format, size) ?: return imageBytes
 
-    return ByteArrayOutputStream().use {
-      builder.toOutputStream(it)
-      it.toByteArray()
+      return ByteArrayOutputStream().use {
+        builder.toOutputStream(it)
+        it.toByteArray()
+      }
+    } finally {
+      decodeSemaphore.release()
     }
   }
 
@@ -108,9 +120,14 @@ class ImageConverter(
     format: ImageType,
     size: Int,
   ): BufferedImage {
-    val builder = resizeImageBuilder(imageBytes, format, size) ?: return ImageIO.read(imageBytes.inputStream())
+    decodeSemaphore.acquire()
+    try {
+      val builder = resizeImageBuilder(imageBytes, format, size) ?: return ImageIO.read(imageBytes.inputStream())
 
-    return builder.asBufferedImage()
+      return builder.asBufferedImage()
+    } finally {
+      decodeSemaphore.release()
+    }
   }
 
   private fun resizeImageBuilder(
@@ -131,11 +148,56 @@ class ImageConverter(
 
     val resizeTo = if (longestEdge != null) min(longestEdge, size) else size
 
+    val sourceBytes =
+      if (dimension != null && supportedWriteFormats.contains(format.imageIOFormat))
+        decodeSubsampled(imageBytes, max(dimension.width, dimension.height), resizeTo)
+          ?.let { bufferedImageToBytes(it, format) }
+          ?: imageBytes
+      else
+        imageBytes
+
     return Thumbnails
-      .of(imageBytes.inputStream())
+      .of(sourceBytes.inputStream())
       .size(resizeTo, resizeTo)
       .imageType(BufferedImage.TYPE_INT_ARGB)
       .outputFormat(format.imageIOFormat)
+  }
+
+  private fun bufferedImageToBytes(
+    image: BufferedImage,
+    format: ImageType,
+  ): ByteArray? {
+    val baos = ByteArrayOutputStream()
+    val written = ImageIO.write(image, format.imageIOFormat, baos)
+    return if (written && baos.size() > 0) baos.toByteArray() else null
+  }
+
+  private fun decodeSubsampled(
+    imageBytes: ByteArray,
+    sourceLongestEdge: Int,
+    targetSize: Int,
+  ): BufferedImage? {
+    if (sourceLongestEdge <= targetSize * 2) return null
+    return try {
+      ImageIO.createImageInputStream(imageBytes.inputStream()).use { ciis ->
+        val readers = ImageIO.getImageReaders(ciis)
+        if (!readers.hasNext()) return null
+        val reader = readers.next()
+        try {
+          reader.input = ciis
+          val factor = max(1, sourceLongestEdge / (targetSize * 2))
+          if (factor < 2) return null
+          val param = reader.defaultReadParam
+          param.setSourceSubsampling(factor, factor, 0, 0)
+          reader.read(0, param)
+        } finally {
+          reader.dispose()
+        }
+      }
+    } catch (e: java.io.IOException) {
+      logger.debug(e) { "Subsampled decode failed, falling back to full decode" }
+      null
+    }
   }
 
   private fun containsAlphaChannel(image: BufferedImage): Boolean = image.colorModel.hasAlpha()

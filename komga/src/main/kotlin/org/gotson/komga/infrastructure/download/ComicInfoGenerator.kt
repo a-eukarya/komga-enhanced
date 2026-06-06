@@ -14,6 +14,29 @@ private val logger = KotlinLogging.logger {}
 
 @Component
 class ComicInfoGenerator {
+  companion object {
+    private val IMAGE_EXTS = listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic")
+  }
+
+  private fun copyEntry(
+    zin: ZipFile,
+    source: ZipEntry,
+    zout: ZipOutputStream,
+    useStored: Boolean,
+  ) {
+    val isImage = IMAGE_EXTS.any { source.name.lowercase().endsWith(it) }
+    val out = ZipEntry(source.name)
+    if (useStored && isImage && source.size >= 0 && source.crc >= 0) {
+      out.method = ZipEntry.STORED
+      out.size = source.size
+      out.compressedSize = source.size
+      out.crc = source.crc
+    }
+    zout.putNextEntry(out)
+    zin.getInputStream(source).use { it.copyTo(zout) }
+    zout.closeEntry()
+  }
+
   fun generateComicInfoXml(
     mangaInfo: MangaInfo,
     chapterInfo: ChapterInfo?,
@@ -83,31 +106,35 @@ class ComicInfoGenerator {
     comicInfoXml: String,
     zipComment: String,
   ) {
-    val tempFile = cbzPath.resolveSibling("${cbzPath.fileName}.comicinfo.tmp")
     try {
-      // ZipFile is tolerant of STORED entries with EXT descriptors that
-      // ZipInputStream rejects ("only DEFLATED entries can have EXT descriptor").
-      ZipFile(cbzPath.toFile()).use { zin ->
-        ZipOutputStream(Files.newOutputStream(tempFile)).use { zipOut ->
+      writeInjected(cbzPath, comicInfoXml, zipComment, useStored = true)
+    } catch (e: java.util.zip.ZipException) {
+      logger.warn(e) { "STORED inject failed for ${cbzPath.fileName}, retrying DEFLATED" }
+      writeInjected(cbzPath, comicInfoXml, zipComment, useStored = false)
+    }
+    verifyZipComment(cbzPath)
+  }
+
+  private fun writeInjected(
+    cbzPath: Path,
+    comicInfoXml: String,
+    zipComment: String,
+    useStored: Boolean,
+  ) {
+    ZipFile(cbzPath.toFile()).use { zin ->
+      org.gotson.komga.infrastructure.util.CbzSafeWriter.safelyReplace(cbzPath) { outStream ->
+        ZipOutputStream(outStream).use { zipOut ->
           zipOut.setComment(zipComment)
           zipOut.putNextEntry(ZipEntry("ComicInfo.xml"))
           zipOut.write(comicInfoXml.toByteArray(Charsets.UTF_8))
           zipOut.closeEntry()
-
           for (entry in zin.entries()) {
             if (entry.name == "ComicInfo.xml") continue
-            zipOut.putNextEntry(ZipEntry(entry.name))
-            zin.getInputStream(entry).use { it.copyTo(zipOut) }
-            zipOut.closeEntry()
+            copyEntry(zin, entry, zipOut, useStored)
           }
         }
       }
-
-      Files.move(tempFile, cbzPath, StandardCopyOption.REPLACE_EXISTING)
-    } finally {
-      Files.deleteIfExists(tempFile)
     }
-    verifyZipComment(cbzPath)
   }
 
   fun injectComicInfoWithRetry(
@@ -117,42 +144,42 @@ class ComicInfoGenerator {
     maxRetries: Int = 5,
     retryDelayMs: Long = 1000L,
   ) {
+    var useStored = true
     for (attempt in 1..maxRetries) {
-      val tempFile = cbzPath.resolveSibling("${cbzPath.fileName}.tmp")
       try {
-        try {
-          ZipFile(cbzPath.toFile()).use { zin ->
-            ZipOutputStream(Files.newOutputStream(tempFile)).use { zipOut ->
+        ZipFile(cbzPath.toFile()).use { zin ->
+          org.gotson.komga.infrastructure.util.CbzSafeWriter.safelyReplace(cbzPath) { outStream ->
+            ZipOutputStream(outStream).use { zipOut ->
               zipOut.setComment(zipComment)
               val writtenEntries = mutableSetOf<String>()
-
               zipOut.putNextEntry(ZipEntry("ComicInfo.xml"))
               zipOut.write(comicInfoXml.toByteArray(Charsets.UTF_8))
               zipOut.closeEntry()
               writtenEntries.add("ComicInfo.xml")
-
               for (entry in zin.entries()) {
                 if (entry.name in writtenEntries) continue
                 writtenEntries.add(entry.name)
-                zipOut.putNextEntry(ZipEntry(entry.name))
-                zin.getInputStream(entry).use { it.copyTo(zipOut) }
-                zipOut.closeEntry()
+                copyEntry(zin, entry, zipOut, useStored)
               }
             }
           }
-
-          Files.move(tempFile, cbzPath, StandardCopyOption.REPLACE_EXISTING)
-          verifyZipComment(cbzPath)
-          return
-        } finally {
-          Files.deleteIfExists(tempFile)
         }
+        verifyZipComment(cbzPath)
+        return
       } catch (e: java.nio.file.FileSystemException) {
         if (attempt < maxRetries) {
           logger.debug { "File locked, retrying in ${retryDelayMs}ms (attempt $attempt/$maxRetries): ${cbzPath.fileName}" }
           Thread.sleep(retryDelayMs * attempt)
         } else {
           logger.warn(e) { "Failed to add ComicInfo.xml to ${cbzPath.fileName} after $maxRetries retries" }
+        }
+      } catch (e: java.util.zip.ZipException) {
+        if (useStored) {
+          logger.warn(e) { "STORED inject failed for ${cbzPath.fileName}, switching to DEFLATED for next attempt" }
+          useStored = false
+        } else {
+          logger.warn(e) { "DEFLATED inject also failed for ${cbzPath.fileName}, giving up" }
+          return
         }
       } catch (e: Exception) {
         logger.warn(e) { "Failed to add ComicInfo.xml to ${cbzPath.fileName}" }
@@ -190,6 +217,31 @@ class ComicInfoGenerator {
       }
     } catch (e: Exception) {
       logger.warn(e) { "Failed to read ComicInfo.xml number from ${cbzFile.name}" }
+      null
+    }
+
+  // Returns the <Web> value (concatenated href list as written by the source). The
+  // repair-comicinfo fix uses this to recognize CBZs that came from a non-MangaDex
+  // source (mangabuddy, cubari, ...) and must not be re-injected with MangaDex
+  // metadata even under force, otherwise the original source metadata is destroyed.
+  fun readWebUrl(cbzFile: File): String? =
+    try {
+      ZipFile(cbzFile).use { zip ->
+        val entry = zip.getEntry("ComicInfo.xml")
+        if (entry == null) {
+          null
+        } else {
+          val xml = zip.getInputStream(entry).use { it.readBytes().decodeToString() }
+          Regex("<Web>(.*?)</Web>", RegexOption.DOT_MATCHES_ALL)
+            .find(xml)
+            ?.groupValues
+            ?.get(1)
+            ?.trim()
+            ?.ifEmpty { null }
+        }
+      }
+    } catch (e: Exception) {
+      logger.warn(e) { "Failed to read ComicInfo.xml Web from ${cbzFile.name}" }
       null
     }
 

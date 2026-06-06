@@ -44,29 +44,35 @@ class MangaDexMetadataPlugin(
    * Priority: preferred language → en → first available
    */
   private fun extractTitle(
-    titleNode: JsonNode?,
+    attributes: JsonNode?,
     preferredLang: String,
   ): String {
-    if (titleNode == null) return "Unknown"
+    if (attributes == null) return "Unknown"
+    val titleNode = attributes.get("title")
+    val altTitles = attributes.get("altTitles")
 
-    // Try preferred language first
     titleNode
-      .get(preferredLang)
+      ?.get(preferredLang)
       ?.asText()
       ?.takeIf { it.isNotBlank() }
       ?.let { return it }
 
-    // Fallback to English if not preferred
+    altTitles
+      ?.firstNotNullOfOrNull { it.get(preferredLang)?.asText()?.takeIf { t -> t.isNotBlank() } }
+      ?.let { return it }
+
     if (preferredLang != "en") {
       titleNode
-        .get("en")
+        ?.get("en")
         ?.asText()
         ?.takeIf { it.isNotBlank() }
         ?.let { return it }
+      altTitles
+        ?.firstNotNullOfOrNull { it.get("en")?.asText()?.takeIf { t -> t.isNotBlank() } }
+        ?.let { return it }
     }
 
-    // Fallback to any available language
-    titleNode.fields()?.let { fields ->
+    titleNode?.fields()?.let { fields ->
       if (fields.hasNext()) {
         return fields.next().value?.asText() ?: "Unknown"
       }
@@ -180,7 +186,7 @@ class MangaDexMetadataPlugin(
       dataArray.map { item ->
         val id = item.get("id").asText()
         val attributes = item.get("attributes")
-        val title = extractTitle(attributes.get("title"), preferredLang)
+        val title = extractTitle(attributes, preferredLang)
         val description = extractDescription(attributes.get("description"), preferredLang)
         val status = attributes.get("status")?.asText()
         val year = attributes.get("year")?.asInt()
@@ -428,7 +434,7 @@ class MangaDexMetadataPlugin(
     return dataArray.map { item ->
       val id = item.get("id").asText()
       val attributes = item.get("attributes")
-      val title = extractTitle(attributes.get("title"), preferredLang)
+      val title = extractTitle(attributes, preferredLang)
       val description = extractDescription(attributes.get("description"), preferredLang)
       val status = attributes.get("status")?.asText()
       val year = attributes.get("year")?.asInt()
@@ -500,7 +506,7 @@ class MangaDexMetadataPlugin(
       val data = json.get("data") ?: return null
       val attributes = data.get("attributes") ?: return null
 
-      val title = extractTitle(attributes.get("title"), preferredLang)
+      val title = extractTitle(attributes, preferredLang)
       val alternativeTitles = extractAlternativeTitles(attributes, title)
       val description = extractDescription(attributes.get("description"), preferredLang)
       val status = attributes.get("status")?.asText()

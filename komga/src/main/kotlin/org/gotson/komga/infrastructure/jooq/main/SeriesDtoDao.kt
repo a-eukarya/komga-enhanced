@@ -29,6 +29,7 @@ import org.gotson.komga.jooq.main.tables.records.SeriesMetadataRecord
 import org.gotson.komga.jooq.main.tables.records.SeriesRecord
 import org.jooq.Condition
 import org.jooq.DSLContext
+import org.jooq.OrderField
 import org.jooq.Record
 import org.jooq.ResultQuery
 import org.jooq.SelectOnConditionStep
@@ -91,6 +92,15 @@ class SeriesDtoDao(
           .from(bm)
           .join(b)
           .on(b.ID.eq(bm.BOOK_ID))
+          .where(b.SERIES_ID.eq(s.ID)),
+      )
+
+  private val newestBookCreatedDate =
+    DSL
+      .field(
+        DSL
+          .select(DSL.max(b.CREATED_DATE))
+          .from(b)
           .where(b.SERIES_ID.eq(s.ID)),
       )
 
@@ -276,20 +286,29 @@ class SeriesDtoDao(
         .and(searchCondition)
         .fetchOne(countDistinct(s.ID)) ?: 0
 
-    val orderBy =
-      pageable.sort.mapNotNull {
-        if (it.property == "relevance" && !seriesIds.isNullOrEmpty()) {
-          s.ID.sortByValues(seriesIds, it.isAscending)
-        } else {
-          if (it.property == "collection.number") {
-            val collectionId = joins.filterIsInstance<RequiredJoin.Collection>().firstOrNull()?.collectionId ?: return@mapNotNull null
-            val f = csAlias(collectionId).NUMBER
-            if (it.isAscending) f.asc() else f.desc()
+    val orderBy = mutableListOf<OrderField<*>>()
+    pageable.sort.forEach { order ->
+      val primary: OrderField<*>? =
+        if (order.property == "relevance" && !seriesIds.isNullOrEmpty()) {
+          s.ID.sortByValues(seriesIds, order.isAscending)
+        } else if (order.property == "collection.number") {
+          val collectionId = joins.filterIsInstance<RequiredJoin.Collection>().firstOrNull()?.collectionId
+          if (collectionId == null) {
+            null
           } else {
-            it.toSortField(sorts)
+            val f = csAlias(collectionId).NUMBER
+            if (order.isAscending) f.asc() else f.desc()
           }
+        } else {
+          order.toSortField(sorts)
+        }
+      if (primary != null) {
+        orderBy += primary
+        if (order.property == "lastModifiedDate" || order.property == "lastModified") {
+          orderBy += if (order.isAscending) newestBookCreatedDate.asc() else newestBookCreatedDate.desc()
         }
       }
+    }
 
     val dtos =
       dslRO

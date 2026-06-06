@@ -23,7 +23,37 @@ data class DownloadCreateDto(
   val title: String?,
   val libraryId: String?,
   val priority: Int = 5,
-)
+  val seriesId: String? = null,
+  val chapterRange: String? = null,
+  val customFilename: String? = null,
+  val customChapterNumber: String? = null,
+  val customVolume: String? = null,
+  val customChapterTitle: String? = null,
+  val skipIfChapterExists: Boolean = true,
+) {
+  fun toOverrides(): org.gotson.komga.domain.service.ChapterDownloadOverrides? {
+    val any =
+      seriesId != null ||
+        !chapterRange.isNullOrBlank() ||
+        !customFilename.isNullOrBlank() ||
+        !customChapterNumber.isNullOrBlank() ||
+        !customVolume.isNullOrBlank() ||
+        !customChapterTitle.isNullOrBlank()
+    return if (!any) {
+      null
+    } else {
+      org.gotson.komga.domain.service.ChapterDownloadOverrides(
+        seriesId = seriesId,
+        chapterRange = chapterRange,
+        customFilename = customFilename,
+        customChapterNumber = customChapterNumber,
+        customVolume = customVolume,
+        customChapterTitle = customChapterTitle,
+        skipIfChapterExists = skipIfChapterExists,
+      )
+    }
+  }
+}
 
 data class DownloadActionDto(
   val action: String, // pause, resume, cancel, retry

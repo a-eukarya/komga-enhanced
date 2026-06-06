@@ -16,6 +16,9 @@
         <v-list-item @click="searchMetadata" v-if="isAdmin">
           <v-list-item-title>Search Online Metadata</v-list-item-title>
         </v-list-item>
+        <v-list-item @click="addChapterDownload" v-if="isAdmin">
+          <v-list-item-title>Add Chapter Download…</v-list-item-title>
+        </v-list-item>
         <v-list-item @click="addToCollection" v-if="isAdmin">
           <v-list-item-title>{{ $t('menu.add_to_collection') }}</v-list-item-title>
         </v-list-item>
@@ -88,6 +91,9 @@ export default Vue.extend({
     },
     addToCollection() {
       this.$store.dispatch('dialogAddSeriesToCollection', [this.series.id])
+    },
+    addChapterDownload() {
+      this.$store.dispatch('dialogAddChapterDownload', this.series)
     },
     async addToReadList() {
       const books = await this.$komgaBooks.getBooksList({

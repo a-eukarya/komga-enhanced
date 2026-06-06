@@ -7,6 +7,7 @@ import org.gotson.komga.domain.model.Dimension
 import org.gotson.komga.domain.model.Media
 import org.gotson.komga.domain.model.MediaExtension
 import org.gotson.komga.domain.model.MediaFile
+import org.gotson.komga.domain.model.OversizedPageCandidate
 import org.gotson.komga.domain.model.ProxyExtension
 import org.gotson.komga.domain.persistence.MediaRepository
 import org.gotson.komga.infrastructure.jooq.SplitDslDaoBase
@@ -102,6 +103,47 @@ class MediaDao(
       .where(m.BOOK_ID.`in`(bookIds))
       .fetch()
       .map { Pair(it[m.BOOK_ID], it[m.PAGE_COUNT]) }
+
+  override fun findAllOversizedPageCandidates(minDimension: Int): Collection<OversizedPageCandidate> {
+    val s = Tables.SERIES
+    val sm = Tables.SERIES_METADATA
+    return dslRO
+      .select(
+        b.ID,
+        b.NAME,
+        b.SERIES_ID,
+        s.NAME,
+        sm.TITLE,
+        p.NUMBER,
+        p.WIDTH,
+        p.HEIGHT,
+        p.FILE_SIZE,
+        p.MEDIA_TYPE,
+      ).from(p)
+      .join(b)
+      .on(p.BOOK_ID.eq(b.ID))
+      .leftJoin(s)
+      .on(b.SERIES_ID.eq(s.ID))
+      .leftJoin(sm)
+      .on(b.SERIES_ID.eq(sm.SERIES_ID))
+      .where(p.WIDTH.ge(minDimension))
+      .and(p.HEIGHT.ge(minDimension))
+      .fetch()
+      .map { r ->
+        OversizedPageCandidate(
+          bookId = r[b.ID],
+          bookName = r[b.NAME],
+          seriesId = r[b.SERIES_ID],
+          seriesName = r[s.NAME] ?: "",
+          seriesTitle = r[sm.TITLE],
+          pageNumber = (r[p.NUMBER] ?: 0) + 1,
+          width = r[p.WIDTH] ?: 0,
+          height = r[p.HEIGHT] ?: 0,
+          fileSize = r[p.FILE_SIZE] ?: 0L,
+          mediaType = r[p.MEDIA_TYPE] ?: "",
+        )
+      }
+  }
 
   private fun DSLContext.find(
     bookId: String,
@@ -314,6 +356,8 @@ class MediaDao(
   }
 
   override fun count(): Long = dslRO.fetchCount(m).toLong()
+
+  override fun countByStatus(status: Media.Status): Long = dslRO.fetchCount(m, m.STATUS.eq(status.name)).toLong()
 
   private fun MediaRecord.toDomain(
     pages: List<BookPage>,

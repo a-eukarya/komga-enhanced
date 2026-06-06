@@ -32,6 +32,27 @@ jobs:
 
       - uses: actions/checkout@v6
 
+      # On a release from main, evict GHA build caches that belong to other refs
+      # (PR branches, feature branches, deleted branches). GHA cache is capped at
+      # 10 GB per repo; without this, stale per-branch caches starve the main cache.
+      - name: Purge GHA caches from non-main refs
+        if: github.ref_name == 'main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          refs=$(gh cache list --limit 100 --json ref --jq '.[].ref' | sort -u | grep -v '^refs/heads/main$' || true)
+          if [ -z "$refs" ]; then
+            echo "No non-main caches to purge."
+            exit 0
+          fi
+          echo "Purging caches for refs:"
+          echo "$refs"
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            gh cache delete --ref "$ref" || true
+          done <<< "$refs"
+
       - name: Compute versions
         id: versions
         env:
@@ -71,19 +92,10 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Cache built komga JAR
-        id: cache_jar
-        uses: actions/cache@v4
-        with:
-          path: komga/build/libs/
-          key: komga-jar-${{ steps.versions.outputs.version_next }}-${{ hashFiles('komga/src/**', 'komga-webui/src/**', 'komga-webui/package-lock.json', '**/build.gradle.kts', 'settings.gradle', 'gradle.properties', 'plugins/**/build.gradle.kts', 'plugins/**/src/**') }}
-
       - name: Setup Gradle
-        if: steps.cache_jar.outputs.cache-hit != 'true'
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build
-        if: steps.cache_jar.outputs.cache-hit != 'true'
         run: ./gradlew :komga:prepareThymeLeaf :komga:bootJar
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"

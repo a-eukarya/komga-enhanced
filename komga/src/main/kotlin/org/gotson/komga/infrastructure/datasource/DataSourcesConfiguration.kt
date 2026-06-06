@@ -2,18 +2,27 @@ package org.gotson.komga.infrastructure.datasource
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import io.github.oshai.kotlinlogging.KotlinLogging
 import org.gotson.komga.infrastructure.configuration.KomgaProperties
+import org.gotson.komga.infrastructure.configuration.KomgaSettingsProvider
+import org.gotson.komga.infrastructure.configuration.SettingChangedEvent
+import org.springframework.beans.factory.ObjectProvider
+import org.springframework.boot.context.event.ApplicationReadyEvent
 import org.springframework.boot.jdbc.DataSourceBuilder
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.context.annotation.Primary
+import org.springframework.context.event.EventListener
 import org.sqlite.SQLiteConfig
 import org.sqlite.SQLiteDataSource
 import javax.sql.DataSource
 
+private val logger = KotlinLogging.logger {}
+
 @Configuration
 class DataSourcesConfiguration(
   private val komgaProperties: KomgaProperties,
+  private val settingsProvider: ObjectProvider<KomgaSettingsProvider>,
 ) {
   @Bean("sqliteDataSourceRW")
   @Primary
@@ -30,6 +39,26 @@ class DataSourcesConfiguration(
       buildDataSource("SqliteMainPoolRO", SqliteUdfDataSource::class.java, komgaProperties.database)
     else
       sqliteDataSourceRW()
+
+  @EventListener(ApplicationReadyEvent::class)
+  fun syncPoolSizeFromSettings() {
+    resizeRoPool()
+  }
+
+  @EventListener(SettingChangedEvent.TaskPoolSize::class)
+  fun taskPoolSizeChanged() {
+    resizeRoPool()
+  }
+
+  private fun resizeRoPool() {
+    if (komgaProperties.database.poolSize != null) return
+    if (!komgaProperties.database.shouldSeparateReadFromWrites()) return
+    val target = settingsProvider.ifAvailable?.taskPoolSize ?: return
+    val ds = sqliteDataSourceRO() as? HikariDataSource ?: return
+    if (ds.maximumPoolSize == target) return
+    logger.info { "Resizing SqliteMainPoolRO from ${ds.maximumPoolSize} to $target connections (taskPoolSize)" }
+    ds.maximumPoolSize = target
+  }
 
   @Bean("tasksDataSourceRW")
   fun tasksDataSourceRW(): DataSource =
@@ -55,10 +84,12 @@ class DataSourcesConfiguration(
   ): HikariDataSource {
     val extraPragmas =
       databaseProps.pragmas.let {
-        if (it.isEmpty())
+        if (it.isEmpty()) {
           ""
-        else
-          "?" + it.map { (key, value) -> "$key=$value" }.joinToString(separator = "&")
+        } else {
+          val separator = if (databaseProps.file.contains("?")) "&" else "?"
+          separator + it.map { (key, value) -> "$key=$value" }.joinToString(separator = "&")
+        }
       }
 
     val dataSource =
@@ -79,12 +110,16 @@ class DataSourcesConfiguration(
     }
 
     val poolSize =
-      if (databaseProps.isMemory())
+      if (databaseProps.isMemory()) {
         1
-      else if (databaseProps.poolSize != null)
+      } else if (databaseProps.poolSize != null) {
         databaseProps.poolSize!!
-      else
-        Runtime.getRuntime().availableProcessors().coerceAtMost(databaseProps.maxPoolSize)
+      } else {
+        Runtime
+          .getRuntime()
+          .availableProcessors()
+          .coerceAtMost(databaseProps.maxPoolSize)
+      }
 
     return HikariDataSource(
       HikariConfig().apply {

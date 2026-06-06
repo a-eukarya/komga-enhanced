@@ -65,6 +65,13 @@ class KomgaSettingsProvider(
       eventPublisher.publishEvent(SettingChangedEvent.TaskPoolSize)
     }
 
+  var logLevel: String =
+    serverSettingsDao.getSettingByKey(Settings.LOG_LEVEL.name, String::class.java) ?: "WARN"
+    set(value) {
+      serverSettingsDao.saveSetting(Settings.LOG_LEVEL.name, value)
+      field = value
+    }
+
   var serverPort: Int? =
     serverSettingsDao.getSettingByKey(Settings.SERVER_PORT.name, Int::class.java)
     set(value) {
@@ -126,4 +133,5 @@ private enum class Settings {
   KOBO_PROXY,
   KOBO_PORT,
   KEPUBIFY_PATH,
+  LOG_LEVEL,
 }
